@@ -55,17 +55,81 @@ def _rewrite_connection_info(conn: str) -> str:
     return conn
 
 
+# Category-specific investigation guidance (injected when classification is available)
+_CATEGORY_GUIDANCE: dict[str, str] = {
+    "web": (
+        "## Category: Web\n"
+        "This is a **web** challenge. Your PRIMARY target is the web service, NOT local distfiles.\n"
+        "- Connect to the web service FIRST. Do not analyze unrelated binaries.\n"
+        "- Sequence: fetch page -> inspect source/forms -> test inputs -> "
+        "identify vulnerability -> exploit -> retrieve flag.\n"
+        "- Common techniques: directory fuzzing, source code review, parameter tampering, "
+        "file upload, SQLi, XSS, SSRF, LFI/RFI, deserialization, JWT manipulation.\n"
+    ),
+    "crypto": (
+        "## Category: Crypto\n"
+        "This is a **cryptography** challenge. Focus on the mathematical structure.\n"
+        "- Identify the algorithm (RSA, AES, ECC, custom cipher).\n"
+        "- Look for weaknesses: small keys, reused nonces, padding oracles, weak PRNGs.\n"
+        "- Tools: RsaCtfTool, sage, openssl, pycryptodome, z3.\n"
+    ),
+    "reverse": (
+        "## Category: Reverse Engineering\n"
+        "This is a **reverse engineering** challenge. Focus on the binary.\n"
+        "- Use `file` to identify the binary type. Do NOT execute x86 binaries on ARM64.\n"
+        "- Use pyghidra for decompilation, or strings/readelf for quick analysis.\n"
+        "- Look for: hardcoded strings, key validation logic, anti-debug checks.\n"
+    ),
+    "pwn": (
+        "## Category: Pwn\n"
+        "This is a **pwn** challenge. Focus on the vulnerable binary/service.\n"
+        "- Identify the vulnerability: buffer overflow, format string, use-after-free, etc.\n"
+        "- Use `checksec`, `readelf`, and gdb for analysis.\n"
+        "- Write an exploit using pwntools. Remember `stty raw -echo` before nc.\n"
+    ),
+    "forensics": (
+        "## Category: Forensics\n"
+        "This is a **forensics** challenge. Focus on the artifact.\n"
+        "- Identify the file type: disk image, memory dump, pcap, filesystem.\n"
+        "- Tools: binwalk, volatility3, sleuthkit (mmls/fls/icat), foremost, strings.\n"
+    ),
+    "steganography": (
+        "## Category: Steganography\n"
+        "This is a **steganography** challenge. Focus on the media file.\n"
+        "- Use `view_image` immediately if the model supports vision.\n"
+        "- Check metadata: exiftool, file properties.\n"
+        "- Common: LSB, steghide, zsteg, binwalk extraction, audio spectrogram.\n"
+    ),
+    "osint": (
+        "## Category: OSINT\n"
+        "This is an **OSINT** challenge. Focus on open-source intelligence.\n"
+        "- Search for information using web tools.\n"
+        "- Common: geolocation, DNS lookup, social media analysis, archive searching.\n"
+    ),
+    "misc": (
+        "## Category: Misc\n"
+        "This is a **misc** challenge. The technique varies.\n"
+        "- Read the description carefully — it often contains the key insight.\n"
+        "- Common: encoding/decoding, custom protocols, programming puzzles.\n"
+    ),
+}
+
+
 def build_prompt(
     meta: ChallengeMeta,
     distfile_names: list[str],
     container_arch: str = "unknown",
     has_named_tools: bool = True,
+    category_hint: str = "",
 ) -> str:
     """Build the system prompt.
 
     has_named_tools: True for Pydantic AI solver (has view_image, webhook_create, etc.
     as discrete tools). False for Claude SDK (bash-only — model should use
     steghide/exiftool/curl instead). Codex has named dynamic tools so uses True.
+
+    category_hint: Deterministic challenge classification (web, crypto, etc.).
+        When set, injects category-specific investigation guidance.
     """
     conn_info = _rewrite_connection_info(meta.connection_info.strip())
 
@@ -147,22 +211,21 @@ def build_prompt(
             "",
         ]
 
+    # Inject category-specific guidance before instructions
+    if category_hint:
+        guidance = _CATEGORY_GUIDANCE.get(category_hint, "")
+        if guidance:
+            lines.append(guidance)
+            lines.append("")
+
     if has_named_tools:
         image_hint = "**Images: call `view_image` FIRST, before any other analysis.**"
         web_hint = "Web: fuzz params, check JS source, cookies, robots.txt. For XSS/SSRF: use `webhook_create`."
-        submit_hint = (
-            "**When you find a plausible flag, call `submit_flag` immediately. "
-            "If it is confirmed correct, STOP immediately. Do not perform any "
-            "additional reconnaissance or tool calls.**"
-    )
+        submit_hint = "**Verify every candidate with `submit_flag`** before reporting."
     else:
         image_hint = "**Images: use `exiftool`, `steghide`, `zsteg`, `strings`, `xxd` via bash.**"
         web_hint = "Web: fuzz params, check JS source, cookies, robots.txt. For XSS/SSRF: use `curl` to webhook.site."
-        submit_hint = (
-            "**When you find a plausible flag, run `submit_flag '<flag>'` immediately. "
-            "If it is confirmed correct, STOP immediately. Do not perform any "
-            "additional reconnaissance or tool calls.**"
-    )
+        submit_hint = "**Verify every candidate with `submit_flag '<flag>'`** (bash command) before reporting."
 
     lines += [
         "",
@@ -171,7 +234,7 @@ def build_prompt(
         "",
         "1. " + ("Connect to the service now." if conn_info else "Inspect distfiles now."),
         "2. Keep using tools until you have the flag.",
-        "3. **Be creative and thorough while the flag is unknown** — try the obvious path, then explore further:",
+        "3. **Be creative and thorough** — try the obvious path, then explore further:",
         "   - Hidden files, env vars, backup files, HTTP headers, error messages, timing, encoding tricks.",
         f"   - {image_hint}",
         f"   - {web_hint}",
@@ -182,9 +245,8 @@ def build_prompt(
         "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
         '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
         f"5. {submit_hint}",
-        "6. **A confirmed flag is terminal. Stop immediately after confirmation.**",
-        "7. Once CORRECT: output `FLAG: <value>` on its own line.",
-        "8. Do not guess. Do not ask.",
+        "6. Once CORRECT: output `FLAG: <value>` on its own line.",
+        "7. Do not guess. Do not ask. Cover maximum surface area.",
     ]
 
     return "\n".join(lines)
