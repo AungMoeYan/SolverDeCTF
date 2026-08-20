@@ -150,11 +150,19 @@ def build_prompt(
     if has_named_tools:
         image_hint = "**Images: call `view_image` FIRST, before any other analysis.**"
         web_hint = "Web: fuzz params, check JS source, cookies, robots.txt. For XSS/SSRF: use `webhook_create`."
-        submit_hint = "**Verify every candidate with `submit_flag`** before reporting."
+        submit_hint = (
+            "**When you find a plausible flag, call `submit_flag` immediately. "
+            "If it is confirmed correct, STOP immediately. Do not perform any "
+            "additional reconnaissance or tool calls.**"
+    )
     else:
         image_hint = "**Images: use `exiftool`, `steghide`, `zsteg`, `strings`, `xxd` via bash.**"
         web_hint = "Web: fuzz params, check JS source, cookies, robots.txt. For XSS/SSRF: use `curl` to webhook.site."
-        submit_hint = "**Verify every candidate with `submit_flag '<flag>'`** (bash command) before reporting."
+        submit_hint = (
+            "**When you find a plausible flag, run `submit_flag '<flag>'` immediately. "
+            "If it is confirmed correct, STOP immediately. Do not perform any "
+            "additional reconnaissance or tool calls.**"
+    )
 
     lines += [
         "",
@@ -163,7 +171,7 @@ def build_prompt(
         "",
         "1. " + ("Connect to the service now." if conn_info else "Inspect distfiles now."),
         "2. Keep using tools until you have the flag.",
-        "3. **Be creative and thorough** — try the obvious path, then explore further:",
+        "3. **Be creative and thorough while the flag is unknown** — try the obvious path, then explore further:",
         "   - Hidden files, env vars, backup files, HTTP headers, error messages, timing, encoding tricks.",
         f"   - {image_hint}",
         f"   - {web_hint}",
@@ -174,8 +182,9 @@ def build_prompt(
         "   - Pwn: `stty raw -echo` before launching vulnerable binaries over nc.",
         '4. **Ignore placeholder flags** — `CTF{flag}`, `CTF{placeholder}` are not real flags.',
         f"5. {submit_hint}",
-        "6. Once CORRECT: output `FLAG: <value>` on its own line.",
-        "7. Do not guess. Do not ask. Cover maximum surface area.",
+        "6. **A confirmed flag is terminal. Stop immediately after confirmation.**",
+        "7. Once CORRECT: output `FLAG: <value>` on its own line.",
+        "8. Do not guess. Do not ask.",
     ]
 
     return "\n".join(lines)

@@ -1,0 +1,4 @@
+Old deployment notes:
+
+The obvious files aren't always useful.
+Check unusual files and inspect their contents carefully.

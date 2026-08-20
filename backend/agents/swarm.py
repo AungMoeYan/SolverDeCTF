@@ -1,4 +1,4 @@
-"""ChallengeSwarm — Parallel solvers racing on one challenge."""
+"""ChallengeSwarm — parallel solvers racing on one challenge."""
 
 from __future__ import annotations
 
@@ -30,12 +30,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Quota fallback: map subscription-backed providers to API-backed equivalents
+# ============================================================
+# QUOTA FALLBACK
+# ============================================================
+
 QUOTA_FALLBACK: dict[str, str] = {
-    "claude-sdk/claude-opus-4-6": "bedrock/us.anthropic.claude-opus-4-6-v1",
-    "codex/gpt-5.4": "azure/gpt-5.4",
-    "codex/gpt-5.4-mini": "azure/gpt-5.4-mini",
-    "codex/gpt-5.3-codex-spark": "zen/gpt-5.3-codex-spark",
+    "claude-sdk/claude-opus-4-6":
+        "bedrock/us.anthropic.claude-opus-4-6-v1",
+
+    "codex/gpt-5.4":
+        "azure/gpt-5.4",
+
+    "codex/gpt-5.4-mini":
+        "azure/gpt-5.4-mini",
+
+    "codex/gpt-5.3-codex-spark":
+        "zen/gpt-5.3-codex-spark",
 }
 
 
@@ -43,44 +53,109 @@ def _quota_fallback_spec(model_spec: str) -> str | None:
     return QUOTA_FALLBACK.get(model_spec)
 
 
+# ============================================================
+# PERFORMANCE SETTINGS
+# ============================================================
+
+# Number of times a solver can be continued after giving up.
+#
+# Initial attempt + 2 continuation attempts = 3 total runs.
+MAX_BUMPS = 2
+
+# Short delay to allow sibling agents to publish findings.
+BUMP_DELAY_SECONDS = 3
+
+# Pydantic AI request budget per solver run.
+#
+# DeepSeek needs multiple model/tool turns for CTF solving.
+REQUEST_LIMIT = 30
+
+
+# ============================================================
+# CHALLENGE SWARM
+# ============================================================
+
 @dataclass
 class ChallengeSwarm:
-    """Parallel solvers racing on one challenge."""
+    """Parallel solvers racing and cooperating on one challenge."""
 
     challenge_dir: str
     meta: ChallengeMeta
     ctfd: CTFdClient
     cost_tracker: CostTracker
     settings: Settings
-    model_specs: list[str] = field(default_factory=lambda: list(DEFAULT_MODELS))
+
+    model_specs: list[str] = field(
+        default_factory=lambda: list(DEFAULT_MODELS)
+    )
+
     no_submit: bool = False
+
     coordinator_inbox: asyncio.Queue | None = None
 
-    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
-    solvers: dict[str, SolverProtocol] = field(default_factory=dict)
-    findings: dict[str, str] = field(default_factory=dict)
+    cancel_event: asyncio.Event = field(
+        default_factory=asyncio.Event
+    )
+
+    solvers: dict[str, SolverProtocol] = field(
+        default_factory=dict
+    )
+
+    findings: dict[str, str] = field(
+        default_factory=dict
+    )
+
     winner: SolverResult | None = None
+
     confirmed_flag: str | None = None
-    _flag_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    _submit_count: dict[str, int] = field(default_factory=dict)  # per-model wrong submission count
-    _submitted_flags: set[str] = field(default_factory=set)  # dedup exact flags
-    _last_submit_time: dict[str, float] = field(default_factory=dict)  # per-model last submit timestamp
-    message_bus: ChallengeMessageBus = field(default_factory=ChallengeMessageBus)
+
+    _flag_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock
+    )
+
+    _submit_count: dict[str, int] = field(
+        default_factory=dict
+    )
+
+    _submitted_flags: set[str] = field(
+        default_factory=set
+    )
+
+    _last_submit_time: dict[str, float] = field(
+        default_factory=dict
+    )
+
+    message_bus: ChallengeMessageBus = field(
+        default_factory=ChallengeMessageBus
+    )
+
+    # ============================================================
+    # CREATE SOLVER
+    # ============================================================
 
     def _create_solver(self, model_spec: str):
-        """Create the right solver type based on provider.
+        """Create the appropriate solver for the provider."""
 
-        - claude-sdk/* → ClaudeSolver (Claude Agent SDK, subscription-first)
-        - codex/* → CodexSolver (Codex App Server, subscription-first)
-        - bedrock/*, azure/*, zen/*, google/* → Pydantic AI Solver (API)
-        """
         provider = provider_from_spec(model_spec)
 
-        def _submit_fn(flag): return self.try_submit_flag(flag, model_spec)
-        _notify = self._make_notify_fn(model_spec)
+        def _submit_fn(flag):
+            return self.try_submit_flag(
+                flag,
+                model_spec,
+            )
+
+        notify = self._make_notify_fn(
+            model_spec
+        )
+
+        # --------------------------------------------------------
+        # Claude SDK
+        # --------------------------------------------------------
 
         if provider == "claude-sdk":
+
             from backend.agents.claude_solver import ClaudeSolver
+
             return ClaudeSolver(
                 model_spec=model_spec,
                 challenge_dir=self.challenge_dir,
@@ -92,11 +167,17 @@ class ChallengeSwarm:
                 no_submit=self.no_submit,
                 submit_fn=_submit_fn,
                 message_bus=self.message_bus,
-                notify_coordinator=_notify,
+                notify_coordinator=notify,
             )
 
+        # --------------------------------------------------------
+        # Codex
+        # --------------------------------------------------------
+
         if provider == "codex":
+
             from backend.agents.codex_solver import CodexSolver
+
             return CodexSolver(
                 model_spec=model_spec,
                 challenge_dir=self.challenge_dir,
@@ -108,22 +189,49 @@ class ChallengeSwarm:
                 no_submit=self.no_submit,
                 submit_fn=_submit_fn,
                 message_bus=self.message_bus,
-                notify_coordinator=_notify,
+                notify_coordinator=notify,
             )
 
-        return self._create_pydantic_solver(model_spec)
+        # --------------------------------------------------------
+        # Pydantic AI providers
+        #
+        # bedrock
+        # azure
+        # zen
+        # google
+        # --------------------------------------------------------
+
+        return self._create_pydantic_solver(
+            model_spec
+        )
+
+    # ============================================================
+    # COORDINATOR MESSAGE
+    # ============================================================
 
     def _make_notify_fn(self, model_spec: str):
-        """Create a callback that pushes solver messages to the coordinator inbox."""
+
         async def _notify(message: str) -> None:
+
             if self.coordinator_inbox:
+
                 self.coordinator_inbox.put_nowait(
                     f"[{self.meta.name}/{model_spec}] {message}"
                 )
+
         return _notify
 
-    def _create_pydantic_solver(self, model_spec: str, sandbox=None, owns_sandbox: bool | None = None) -> Solver:
-        """Create a Pydantic AI solver. Pass sandbox to reuse an existing container (quota fallback)."""
+    # ============================================================
+    # PYDANTIC AI SOLVER
+    # ============================================================
+
+    def _create_pydantic_solver(
+        self,
+        model_spec: str,
+        sandbox=None,
+        owns_sandbox: bool | None = None,
+    ) -> Solver:
+
         solver = Solver(
             model_spec=model_spec,
             challenge_dir=self.challenge_dir,
@@ -135,214 +243,737 @@ class ChallengeSwarm:
             sandbox=sandbox,
             owns_sandbox=owns_sandbox,
         )
+
         solver.deps.message_bus = self.message_bus
         solver.deps.model_spec = model_spec
         solver.deps.no_submit = self.no_submit
-        solver.deps.submit_fn = lambda flag: self.try_submit_flag(flag, model_spec)
-        solver.deps.notify_coordinator = self._make_notify_fn(model_spec)
+
+        solver.deps.submit_fn = (
+            lambda flag:
+            self.try_submit_flag(
+                flag,
+                model_spec,
+            )
+        )
+
+        solver.deps.notify_coordinator = (
+            self._make_notify_fn(
+                model_spec
+            )
+        )
+
         return solver
 
-    def _gather_sibling_insights(self, exclude_model: str) -> str:
+    # ============================================================
+    # SIBLING FINDINGS
+    # ============================================================
+
+    def _gather_sibling_insights(
+        self,
+        exclude_model: str,
+    ) -> str:
+
         parts: list[str] = []
+
         for model, finding in self.findings.items():
-            if model != exclude_model and finding:
-                parts.append(f"[{model}]: {finding}")
-        return "\n\n".join(parts) if parts else "No sibling insights available yet."
 
-    # Escalating cooldowns after incorrect submissions (per model)
-    SUBMISSION_COOLDOWNS = [0, 30, 120, 300, 600]  # 0s, 30s, 2min, 5min, 10min
+            if model == exclude_model:
+                continue
 
-    async def try_submit_flag(self, flag: str, model_spec: str) -> tuple[str, bool]:
-        """Cooldown-gated, deduplicated flag submission. Returns (display, is_confirmed)."""
+            if not finding:
+                continue
+
+            # Keep context small.
+            finding = finding[:1200]
+
+            parts.append(
+                f"[{model}]\n{finding}"
+            )
+
+        if not parts:
+
+            return (
+                "No sibling insights are available yet."
+            )
+
+        return "\n\n".join(parts)
+
+    # ============================================================
+    # FLAG SUBMISSION
+    # ============================================================
+
+    SUBMISSION_COOLDOWNS = [
+        0,
+        10,
+        30,
+        60,
+        120,
+    ]
+
+    async def try_submit_flag(
+        self,
+        flag: str,
+        model_spec: str,
+    ) -> tuple[str, bool]:
+
         async with self._flag_lock:
+
+            # ----------------------------------------------------
+            # Already solved
+            # ----------------------------------------------------
+
             if self.confirmed_flag:
-                return f"ALREADY SOLVED — flag already confirmed: {self.confirmed_flag}", True
+
+                return (
+                    "ALREADY SOLVED — "
+                    f"flag already confirmed: "
+                    f"{self.confirmed_flag}",
+                    True,
+                )
 
             normalized = flag.strip()
 
-            # Dedup exact flags across all models
-            if normalized in self._submitted_flags:
-                return "INCORRECT — already tried this exact flag.", False
+            if not normalized:
 
-            # Escalating cooldown after incorrect submissions
-            wrong_count = self._submit_count.get(model_spec, 0)
-            cooldown_idx = min(wrong_count, len(self.SUBMISSION_COOLDOWNS) - 1)
-            cooldown = self.SUBMISSION_COOLDOWNS[cooldown_idx]
-            if cooldown > 0:
-                last_time = self._last_submit_time.get(model_spec, 0)
-                elapsed = time.monotonic() - last_time
+                return (
+                    "INVALID — empty flag.",
+                    False,
+                )
+
+            # ----------------------------------------------------
+            # Duplicate flag
+            # ----------------------------------------------------
+
+            if normalized in self._submitted_flags:
+
+                return (
+                    "INCORRECT — "
+                    "this exact flag was already tried.",
+                    False,
+                )
+
+            # ----------------------------------------------------
+            # Submission cooldown
+            # ----------------------------------------------------
+
+            wrong_count = self._submit_count.get(
+                model_spec,
+                0,
+            )
+
+            cooldown_idx = min(
+                wrong_count,
+                len(self.SUBMISSION_COOLDOWNS) - 1,
+            )
+
+            cooldown = self.SUBMISSION_COOLDOWNS[
+                cooldown_idx
+            ]
+
+            if cooldown:
+
+                last_time = self._last_submit_time.get(
+                    model_spec,
+                    0,
+                )
+
+                elapsed = (
+                    time.monotonic()
+                    - last_time
+                )
+
                 if elapsed < cooldown:
-                    remaining = int(cooldown - elapsed)
+
+                    remaining = max(
+                        1,
+                        int(cooldown - elapsed),
+                    )
+
                     return (
-                        f"COOLDOWN — wait {remaining}s before submitting again. "
-                        f"You have {wrong_count} incorrect submissions. "
-                        "Use this time to do deeper analysis and verify your flag.",
+                        f"COOLDOWN — wait {remaining}s "
+                        "before submitting again.",
                         False,
                     )
 
-            self._submitted_flags.add(normalized)
+            self._submitted_flags.add(
+                normalized
+            )
 
-            from backend.tools.core import do_submit_flag
-            display, is_confirmed = await do_submit_flag(self.ctfd, self.meta.name, flag)
-            if is_confirmed:
-                self.confirmed_flag = normalized
-            else:
-                self._submit_count[model_spec] = wrong_count + 1
-                self._last_submit_time[model_spec] = time.monotonic()
-            return display, is_confirmed
+        # ----------------------------------------------------
+        # Dry run
+        # ----------------------------------------------------
 
-    async def _run_solver(self, model_spec: str) -> SolverResult | None:
-        solver = self._create_solver(model_spec)
+        if self.no_submit:
+
+            logger.info(
+                "[%s/%s] Dry-run candidate: %s",
+                self.meta.name,
+                model_spec,
+                normalized,
+            )
+
+            return (
+                f"DRY RUN — candidate flag: {normalized}",
+                False,
+            )
+
+        # ----------------------------------------------------
+        # Actual CTFd submission
+        # ----------------------------------------------------
+
+        from backend.tools.core import do_submit_flag
+
+        try:
+            display, confirmed = await do_submit_flag(
+                self.ctfd,
+                self.meta.name,
+                normalized,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s/%s] Flag submission failed: %s",
+                self.meta.name,
+                model_spec,
+                exc,
+            )
+
+            return (
+                f"SUBMISSION ERROR — {exc}",
+                False,
+            )
+
+        # Only mark the flag as submitted after the request
+        # actually reached CTFd.
+        self._submitted_flags.add(normalized)
+
+        if confirmed:
+
+            self.confirmed_flag = normalized
+
+            logger.info(
+                "[%s] FLAG CONFIRMED by %s: %s",
+                self.meta.name,
+                model_spec,
+                normalized,
+            )
+
+            self.cancel_event.set()
+
+            return (
+                display,
+                True,
+            )
+
+        # ----------------------------------------------------
+        # Incorrect submission
+        # ----------------------------------------------------
+
+        self._submit_count[model_spec] = (
+            wrong_count + 1
+        )
+
+        self._last_submit_time[model_spec] = (
+            time.monotonic()
+        )
+
+        return (
+            display,
+            False,
+        )
+
+    # ============================================================
+    # RUN ONE SOLVER
+    # ============================================================
+
+    async def _run_solver(
+        self,
+        model_spec: str,
+    ) -> SolverResult | None:
+
+        solver = self._create_solver(
+            model_spec
+        )
+
         self.solvers[model_spec] = solver
 
         try:
-            result, final_solver = await self._run_solver_loop(solver, model_spec)
+
+            result, final_solver = (
+                await self._run_solver_loop(
+                    solver,
+                    model_spec,
+                )
+            )
+
             solver = final_solver
+
             return result
-        except Exception as e:
-            logger.error(f"[{self.meta.name}/{model_spec}] Fatal: {e}", exc_info=True)
+
+        except Exception as exc:
+
+            logger.error(
+                "[%s/%s] Fatal: %s",
+                self.meta.name,
+                model_spec,
+                exc,
+                exc_info=True,
+            )
+
             return None
+
         finally:
+
             await solver.stop()
 
-    async def _run_solver_loop(self, solver, model_spec: str) -> tuple[SolverResult, SolverProtocol]:
-        """Inner loop: start → run → bump → run → ..."""
+    # ============================================================
+    # SOLVER LOOP
+    # ============================================================
+
+    async def _run_solver_loop(
+        self,
+        solver,
+        model_spec: str,
+    ) -> tuple[SolverResult, SolverProtocol]:
+
         bump_count = 0
         consecutive_errors = 0
+
         result = SolverResult(
-            flag=None, status=CANCELLED, findings_summary="",
-            step_count=0, cost_usd=0.0, log_path="",
+            flag=None,
+            status=CANCELLED,
+            findings_summary="",
+            step_count=0,
+            cost_usd=0.0,
+            log_path="",
         )
+
+        # --------------------------------------------------------
+        # Start solver
+        # --------------------------------------------------------
+
         await solver.start()
 
         while not self.cancel_event.is_set():
-            result = await solver.run_until_done_or_gave_up()
 
-            # Only broadcast useful findings — skip errors and broken solvers
-            if (result.status not in (ERROR, QUOTA_ERROR)
-                    and not (result.step_count == 0 and result.cost_usd == 0)
-                    and result.findings_summary
-                    and not result.findings_summary.startswith(("Error:", "Turn failed:"))):
-                self.findings[model_spec] = result.findings_summary
-                await self.message_bus.post(model_spec, result.findings_summary[:500])
+            # ----------------------------------------------------
+            # Run model
+            # ----------------------------------------------------
+
+            result = (
+                await solver.run_until_done_or_gave_up()
+            )
+
+            # ----------------------------------------------------
+            # Store useful findings
+            # ----------------------------------------------------
+
+            if (
+                result.status
+                not in (
+                    ERROR,
+                    QUOTA_ERROR,
+                )
+                and result.step_count > 0
+                and result.findings_summary
+                and not result.findings_summary.startswith(
+                    (
+                        "Error:",
+                        "Turn failed:",
+                    )
+                )
+            ):
+
+                self.findings[model_spec] = (
+                    result.findings_summary[:1500]
+                )
+
+                await self.message_bus.post(
+                    model_spec,
+                    result.findings_summary[:800],
+                )
+
+            # ----------------------------------------------------
+            # FLAG FOUND
+            # ----------------------------------------------------
 
             if result.status == FLAG_FOUND:
+
                 self.cancel_event.set()
+
                 self.winner = result
+
                 logger.info(
-                    f"[{self.meta.name}] Flag found by {model_spec}: {result.flag}"
+                    "[%s] Flag found by %s: %s",
+                    self.meta.name,
+                    model_spec,
+                    result.flag,
                 )
+
                 return result, solver
+
+            # ----------------------------------------------------
+            # CANCELLED
+            # ----------------------------------------------------
 
             if result.status == CANCELLED:
                 break
 
-            # Quota exhaustion: fall back to API-backed Pydantic AI solver
+            # ----------------------------------------------------
+            # QUOTA ERROR
+            # ----------------------------------------------------
+
             if result.status == QUOTA_ERROR:
-                fallback_spec = _quota_fallback_spec(model_spec)
+
+                fallback_spec = (
+                    _quota_fallback_spec(
+                        model_spec
+                    )
+                )
+
                 if fallback_spec:
+
                     logger.warning(
-                        f"[{self.meta.name}/{model_spec}] Quota exhausted — falling back to {fallback_spec}"
+                        "[%s/%s] Quota exhausted — "
+                        "falling back to %s",
+                        self.meta.name,
+                        model_spec,
+                        fallback_spec,
                     )
-                    existing_sandbox = solver.sandbox
-                    # Detach sandbox from old solver so stop() doesn't destroy it
-                    solver.sandbox = None  # type: ignore[assignment]
+
+                    existing_sandbox = (
+                        solver.sandbox
+                    )
+
+                    # Prevent old solver from deleting
+                    # the shared sandbox.
+                    solver.sandbox = None
+
                     await solver.stop()
-                    solver = self._create_pydantic_solver(fallback_spec, sandbox=existing_sandbox, owns_sandbox=True)
-                    self.solvers[model_spec] = solver
-                    await solver.start()
-                    continue
-                # No fallback available, treat as error
-                break
 
-            if result.status in (GAVE_UP, ERROR):
-                if result.step_count == 0 and result.cost_usd == 0:
-                    logger.warning(
-                        f"[{self.meta.name}/{model_spec}] Broken (0 steps, $0) — not bumping"
-                    )
-                    break
-
-                # Track consecutive errors — stop after 3 in a row
-                if result.status == ERROR:
-                    consecutive_errors += 1
-                    if consecutive_errors >= 3:
-                        logger.warning(
-                            f"[{self.meta.name}/{model_spec}] {consecutive_errors} consecutive errors — giving up"
+                    solver = (
+                        self._create_pydantic_solver(
+                            fallback_spec,
+                            sandbox=existing_sandbox,
+                            owns_sandbox=True,
                         )
-                        break
-                else:
+                    )
+
+                    self.solvers[model_spec] = solver
+
+                    await solver.start()
+
+                    bump_count = 0
                     consecutive_errors = 0
 
+                    continue
+
+                break
+
+            # ----------------------------------------------------
+            # GAVE UP / ERROR
+            # ----------------------------------------------------
+
+            if result.status in (
+                GAVE_UP,
+                ERROR,
+            ):
+
+                # Broken solver.
+                if (
+                    result.step_count == 0
+                    and result.cost_usd == 0
+                ):
+
+                    logger.warning(
+                        "[%s/%s] Broken solver — "
+                        "zero steps.",
+                        self.meta.name,
+                        model_spec,
+                    )
+
+                    break
+
+                # ------------------------------------------------
+                # Error tracking
+                # ------------------------------------------------
+
+                if result.status == ERROR:
+
+                    consecutive_errors += 1
+
+                    if consecutive_errors >= 3:
+
+                        logger.warning(
+                            "[%s/%s] Three consecutive errors.",
+                            self.meta.name,
+                            model_spec,
+                        )
+
+                        break
+
+                else:
+
+                    consecutive_errors = 0
+
+                # ------------------------------------------------
+                # Maximum continuation rounds
+                # ------------------------------------------------
+
+                if bump_count >= MAX_BUMPS:
+
+                    logger.info(
+                        "[%s/%s] Maximum continuation "
+                        "rounds reached.",
+                        self.meta.name,
+                        model_spec,
+                    )
+
+                    break
+
                 bump_count += 1
-                # Cooldown between bumps — check cancellation during wait
+
+                # ------------------------------------------------
+                # Give siblings time to publish findings
+                # ------------------------------------------------
+
                 try:
+
                     await asyncio.wait_for(
                         self.cancel_event.wait(),
-                        timeout=min(bump_count * 30, 300),
+                        timeout=BUMP_DELAY_SECONDS,
                     )
-                    break  # cancelled during cooldown
+
+                    break
+
                 except TimeoutError:
-                    pass  # cooldown elapsed, proceed with bump
-                insights = self._gather_sibling_insights(model_spec)
-                solver.bump(insights)
-                logger.info(
-                    f"[{self.meta.name}/{model_spec}] Bumped ({bump_count}), resuming"
+                    pass
+
+                # ------------------------------------------------
+                # Get sibling intelligence
+                # ------------------------------------------------
+
+                insights = (
+                    self._gather_sibling_insights(
+                        model_spec
+                    )
                 )
+
+                # ------------------------------------------------
+                # Resume with new information
+                # ------------------------------------------------
+
+                solver.bump(
+                    insights
+                )
+
+                logger.info(
+                    "[%s/%s] Bumped %d/%d",
+                    self.meta.name,
+                    model_spec,
+                    bump_count,
+                    MAX_BUMPS,
+                )
+
                 continue
 
         return result, solver
 
-    async def run(self) -> SolverResult | None:
-        """Run all solvers in parallel. Returns the winner's result or None."""
+    # ============================================================
+    # RUN SWARM
+    # ============================================================
+
+    async def run(
+        self,
+    ) -> SolverResult | None:
+
+        if not self.model_specs:
+
+            logger.error(
+                "[%s] No models configured.",
+                self.meta.name,
+            )
+
+            return None
+
+        logger.info(
+            "[%s] Starting swarm: %s",
+            self.meta.name,
+            ", ".join(self.model_specs),
+        )
+
+        # --------------------------------------------------------
+        # Start all models concurrently.
+        # --------------------------------------------------------
+
         tasks = [
-            asyncio.create_task(self._run_solver(spec), name=f"solver-{spec}")
+            asyncio.create_task(
+                self._run_solver(spec),
+                name=f"solver-{spec}",
+            )
             for spec in self.model_specs
         ]
 
         try:
+
             while tasks:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                done, pending = await asyncio.wait(
+                    tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                # ------------------------------------------------
+                # Check completed tasks
+                # ------------------------------------------------
 
                 for task in done:
+
                     try:
+
                         result = task.result()
-                    except Exception:
+
+                    except asyncio.CancelledError:
+
                         continue
-                    if result and result.status == FLAG_FOUND:
+
+                    except Exception as exc:
+
+                        logger.error(
+                            "[%s] Solver failed: %s",
+                            self.meta.name,
+                            exc,
+                            exc_info=True,
+                        )
+
+                        continue
+
+                    if not result:
+                        continue
+
+                    # --------------------------------------------
+                    # Winner found
+                    # --------------------------------------------
+
+                    if result.status == FLAG_FOUND:
+
                         self.cancel_event.set()
-                        for p in pending:
-                            p.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
+
+                        self.winner = result
+
+                        logger.info(
+                            "[%s] Winner: %s",
+                            self.meta.name,
+                            result.flag,
+                        )
+
+                        # Stop every remaining solver.
+                        for pending_task in pending:
+                            pending_task.cancel()
+
+                        await asyncio.gather(
+                            *pending,
+                            return_exceptions=True,
+                        )
+
                         return result
 
                 tasks = list(pending)
 
+            # ----------------------------------------------------
+            # Nobody found flag.
+            # ----------------------------------------------------
+
             self.cancel_event.set()
+
             return self.winner
-        except Exception as e:
-            logger.error(f"[{self.meta.name}] Swarm error: {e}", exc_info=True)
+
+        except asyncio.CancelledError:
+
             self.cancel_event.set()
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+
+            for task in tasks:
+                task.cancel()
+
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
+            raise
+
+        except Exception as exc:
+
+            logger.error(
+                "[%s] Swarm error: %s",
+                self.meta.name,
+                exc,
+                exc_info=True,
+            )
+
+            self.cancel_event.set()
+
+            for task in tasks:
+                task.cancel()
+
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
             return None
 
+    # ============================================================
+    # KILL
+    # ============================================================
+
     def kill(self) -> None:
-        """Cancel all agents for this challenge."""
+        """Cancel all agents."""
+
         self.cancel_event.set()
 
+    # ============================================================
+    # STATUS
+    # ============================================================
+
     def get_status(self) -> dict:
-        """Get per-agent progress and findings."""
+
+        agents = {}
+
+        for spec in self.model_specs:
+
+            if (
+                self.winner
+                and self.winner.flag
+            ):
+
+                status = "won"
+
+            elif (
+                spec in self.solvers
+                and not self.cancel_event.is_set()
+            ):
+
+                status = "running"
+
+            else:
+
+                status = "finished"
+
+            agents[spec] = {
+                "findings": self.findings.get(
+                    spec,
+                    "",
+                ),
+                "status": status,
+            }
+
         return {
             "challenge": self.meta.name,
             "cancelled": self.cancel_event.is_set(),
-            "winner": self.winner.flag if self.winner else None,
-            "agents": {
-                spec: {
-                    "findings": self.findings.get(spec, ""),
-                    "status": "running" if spec in self.solvers and not self.cancel_event.is_set()
-                             else ("won" if self.winner and self.winner.flag else "finished"),
-                }
-                for spec in self.model_specs
-            },
+            "winner": (
+                self.winner.flag
+                if self.winner
+                else None
+            ),
+            "agents": agents,
         }

@@ -58,6 +58,13 @@ FALLBACK_PRICING: dict[str, dict[str, float]] = {
         "cached_input": 0.02,
         "output": 0.60,
     },
+    # Amazon Bedrock — DeepSeek V3.2
+    # ap-northeast-1 (Tokyo), Standard on-demand
+    "deepseek.v3.2": {
+        "input": 0.74,
+        "cached_input": 0.74,
+        "output": 2.22,
+    },
 }
 
 

@@ -1,0 +1,4 @@
+name: recon-test
+category: misc
+description: Investigate the provided files and recover the hidden flag.
+points: 100

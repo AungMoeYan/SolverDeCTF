@@ -1,0 +1,8 @@
+[application]
+name=internal-service
+debug=false
+environment=production
+
+[backup]
+enabled=true
+location=archive.dat
