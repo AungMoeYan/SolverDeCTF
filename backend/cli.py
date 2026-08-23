@@ -1,20 +1,24 @@
 """CTF Agent CLI entry point.
 
-Supports two modes:
+Architecture:
 
-1. Interactive mode:
-       ctf-solve
+    ONE CTF
+        |
+        v
+    ONE Solver
+        |
+        v
+    ONE LLM
+        |
+        v
+    ONE Docker sandbox
+        |
+        v
+    FLAG / GIVE UP
 
-   The operator provides:
-       - challenge description
-       - optional hint
-       - optional evidence paths
-
-2. Existing challenge-directory mode:
-       ctf-solve --challenge test-challenges/recon-test
-
-The interactive mode is intended to become the normal operator interface,
-while the existing command-line options remain available for compatibility.
+The solver itself owns the agentic tool loop.  The CLI is responsible only
+for collecting input, constructing dependencies, starting the solver, and
+displaying the result.
 """
 
 from __future__ import annotations
@@ -91,7 +95,6 @@ def _read_multiline(prompt: str) -> str:
     while True:
         try:
             line = input()
-
         except EOFError:
             break
 
@@ -103,11 +106,7 @@ def _read_multiline(prompt: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _interactive_session() -> tuple[
-    str,
-    str,
-    list[str],
-]:
+def _interactive_session() -> tuple[str, str, list[str]]:
     """Collect challenge information from the operator."""
 
     console.print()
@@ -142,12 +141,15 @@ def _interactive_session() -> tuple[
     console.print(
         "[dim]Examples:[/dim]"
     )
+
     console.print(
         "[dim]  /home/kali/Downloads/disk.dd[/dim]"
     )
+
     console.print(
         "[dim]  /home/kali/Downloads/evidence/[/dim]"
     )
+
     console.print(
         "[dim]Enter one path per line. "
         "Press ENTER twice when finished.[/dim]"
@@ -158,7 +160,6 @@ def _interactive_session() -> tuple[
     while True:
         try:
             line = input()
-
         except EOFError:
             break
 
@@ -181,92 +182,70 @@ def _interactive_session() -> tuple[
 @click.option(
     "--ctfd-url",
     default=None,
-    help="CTFd URL (overrides .env)",
+    help="CTFd URL (overrides .env).",
 )
 @click.option(
     "--ctfd-token",
     default=None,
-    help="CTFd API token (overrides .env)",
+    help="CTFd API token (overrides .env).",
 )
 @click.option(
     "--image",
     default="ctf-sandbox",
-    help="Docker sandbox image name",
+    help="Docker sandbox image name.",
 )
 @click.option(
-    "--models",
-    multiple=True,
-    help="Model specs (default: all configured)",
+    "--model",
+    "model_spec",
+    default=None,
+    help="Single LLM model specification.",
 )
 @click.option(
     "--challenge",
     default=None,
-    help="Solve an existing challenge directory",
+    help="Solve an existing challenge directory.",
 )
 @click.option(
     "--challenges-dir",
     default="challenges",
-    help="Directory for challenge files",
+    help="Directory for challenge files.",
 )
 @click.option(
     "--instruction",
     default="",
-    help="Extra instruction for the solver",
+    help="Extra instruction for the solver.",
 )
 @click.option(
     "--description",
     default="",
-    help="Challenge description",
+    help="Challenge description.",
 )
 @click.option(
     "--hint",
     default="",
-    help="Challenge hint",
+    help="Challenge hint.",
 )
 @click.option(
     "--evidence",
     multiple=True,
-    help="Host evidence file/directory",
+    help="Host evidence file/directory.",
 )
 @click.option(
     "--no-submit",
     is_flag=True,
-    help="Dry run — don't submit flags",
-)
-@click.option(
-    "--coordinator-model",
-    default=None,
-    help="Model for coordinator",
-)
-@click.option(
-    "--coordinator",
-    default="claude",
-    type=click.Choice(["claude", "codex"]),
-    help="Coordinator backend",
-)
-@click.option(
-    "--max-challenges",
-    default=10,
-    type=int,
-    help="Max challenges solved concurrently",
-)
-@click.option(
-    "--msg-port",
-    default=0,
-    type=int,
-    help="Operator message port (0 = auto)",
+    help="Dry run — don't submit flags.",
 )
 @click.option(
     "-v",
     "--verbose",
     is_flag=True,
-    help="Verbose logging",
+    help="Verbose logging.",
 )
 def main(
     ctfd_url: str | None,
     ctfd_token: str | None,
     image: str,
-    models: tuple[str, ...],
+    model_spec: str | None,
     challenge: str | None,
     challenges_dir: str,
     instruction: str,
@@ -274,29 +253,15 @@ def main(
     hint: str,
     evidence: tuple[str, ...],
     no_submit: bool,
-    coordinator_model: str | None,
-    coordinator: str,
-    max_challenges: int,
-    msg_port: int,
     verbose: bool,
 ) -> None:
-    """CTF Agent.
-
-    With no --challenge argument, starts the interactive solver.
-
-    Examples:
-
-        ctf-solve
-
-        ctf-solve --challenge test-challenges/recon-test
-
-        ctf-solve --description "Find SSTI flag" --hint "Try Jinja2"
-
-        ctf-solve --description "Analyze disk" \\
-            --evidence /home/kali/Downloads/disk.dd
-    """
+    """Run one CTF challenge with one autonomous solver."""
 
     _setup_logging(verbose)
+
+    # ------------------------------------------------------------------
+    # Settings
+    # ------------------------------------------------------------------
 
     settings = Settings(
         sandbox_image=image,
@@ -308,9 +273,7 @@ def main(
     if ctfd_token:
         settings.ctfd_token = ctfd_token
 
-    settings.max_concurrent_challenges = max_challenges
-
-    # Keep the existing operator instruction mechanism.
+    # Preserve operator instruction.
     object.__setattr__(
         settings,
         "solver_instruction",
@@ -318,23 +281,32 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # Model selection
+    # ONE MODEL ONLY
     # ------------------------------------------------------------------
 
-    model_specs = (
-        list(models)
-        if models
-        else list(DEFAULT_MODELS)
+    selected_model = (
+        model_spec
+        or DEFAULT_MODELS[0]
+    )
+
+    console.print(
+        "\n[bold]CTF Agent[/bold]"
+    )
+
+    console.print(
+        "  Architecture: [green]ONE CTF → ONE AGENT → ONE LLM[/green]"
+    )
+
+    console.print(
+        f"  Model: [cyan]{selected_model}[/cyan]"
+    )
+
+    console.print(
+        f"  Image: [cyan]{settings.sandbox_image}[/cyan]"
     )
 
     # ------------------------------------------------------------------
     # Interactive mode
-    #
-    # If the operator simply runs:
-    #
-    #     ctf-solve
-    #
-    # collect the challenge information interactively.
     # ------------------------------------------------------------------
 
     if (
@@ -354,51 +326,39 @@ def main(
         )
 
     # ------------------------------------------------------------------
-    # Display startup information
+    # Display operator input
     # ------------------------------------------------------------------
-
-    console.print(
-        "\n[bold]CTF Agent v2[/bold]"
-    )
-
-    console.print(
-        f"  Models: {', '.join(model_specs)}"
-    )
-
-    console.print(
-        f"  Image: {settings.sandbox_image}"
-    )
-
-    console.print(
-        f"  Max challenges: {max_challenges}"
-    )
 
     if description.strip():
         console.print(
-            "  Description: "
-            f"[cyan]{description.strip()[:500]}[/cyan]"
+            "\n[bold]Description:[/bold]"
+        )
+        console.print(
+            description.strip()[:2000]
         )
 
     if hint.strip():
         console.print(
-            "  Hint: "
-            f"[cyan]{hint.strip()[:500]}[/cyan]"
+            "\n[bold]Hint:[/bold]"
+        )
+        console.print(
+            hint.strip()[:2000]
         )
 
     if evidence:
         console.print(
-            "  Evidence:"
+            "\n[bold]Evidence:[/bold]"
         )
 
         for path in evidence:
             console.print(
-                f"    [cyan]{path}[/cyan]"
+                f"  [cyan]{path}[/cyan]"
             )
 
     console.print()
 
     # ------------------------------------------------------------------
-    # Existing challenge-directory mode
+    # Existing challenge
     # ------------------------------------------------------------------
 
     if challenge:
@@ -406,9 +366,8 @@ def main(
             _run_single(
                 settings=settings,
                 challenge_dir=challenge,
-                model_specs=model_specs,
+                model_spec=selected_model,
                 no_submit=no_submit,
-                max_challenges=max_challenges,
                 description=description,
                 hint=hint,
                 evidence=list(evidence),
@@ -418,15 +377,14 @@ def main(
         return
 
     # ------------------------------------------------------------------
-    # Interactive solver mode
+    # Interactive challenge
     # ------------------------------------------------------------------
 
     asyncio.run(
         _run_interactive(
             settings=settings,
-            model_specs=model_specs,
+            model_spec=selected_model,
             no_submit=no_submit,
-            max_challenges=max_challenges,
             description=description,
             hint=hint,
             evidence=list(evidence),
@@ -435,23 +393,83 @@ def main(
 
 
 # ============================================================================
-# EXISTING SINGLE CHALLENGE MODE
+# COMMON SOLVER CONFIGURATION
+# ============================================================================
+
+
+def _configure_solver_context(
+    settings: Settings,
+    description: str,
+    hint: str,
+    evidence: list[str],
+) -> None:
+    """Make operator-provided information available to the Solver."""
+
+    instruction_parts: list[str] = []
+
+    if description.strip():
+        instruction_parts.append(
+            "Operator challenge description:\n"
+            f"{description.strip()}"
+        )
+
+    if hint.strip():
+        instruction_parts.append(
+            "Operator hint:\n"
+            f"{hint.strip()}"
+        )
+
+    if evidence:
+        instruction_parts.append(
+            "Operator-provided evidence paths:\n"
+            + "\n".join(
+                f"- {path}"
+                for path in evidence
+            )
+        )
+
+    object.__setattr__(
+        settings,
+        "solver_instruction",
+        "\n\n".join(instruction_parts),
+    )
+
+    object.__setattr__(
+        settings,
+        "solver_description",
+        description.strip(),
+    )
+
+    object.__setattr__(
+        settings,
+        "solver_hint",
+        hint.strip(),
+    )
+
+    object.__setattr__(
+        settings,
+        "solver_evidence",
+        evidence,
+    )
+
+
+# ============================================================================
+# SINGLE CHALLENGE
 # ============================================================================
 
 
 async def _run_single(
     settings: Settings,
     challenge_dir: str,
-    model_specs: list[str],
+    model_spec: str,
     no_submit: bool,
-    max_challenges: int,
     description: str = "",
     hint: str = "",
     evidence: list[str] | None = None,
 ) -> None:
-    """Run an existing challenge with a solver swarm."""
+    """Solve exactly one challenge with exactly one Solver."""
 
-    from backend.agents.swarm import ChallengeSwarm
+    from backend.agents.solver import Solver
     from backend.cost_tracker import CostTracker
     from backend.ctfd import CTFdClient
     from backend.prompts import ChallengeMeta
@@ -459,16 +477,28 @@ async def _run_single(
         cleanup_orphan_containers,
         configure_semaphore,
     )
+    from backend.solver_base import FLAG_FOUND
 
     evidence = evidence or []
 
-    max_containers = (
-        max_challenges * len(model_specs)
+    # ------------------------------------------------------------------
+    # Solver context
+    # ------------------------------------------------------------------
+
+    _configure_solver_context(
+        settings=settings,
+        description=description,
+        hint=hint,
+        evidence=evidence,
     )
 
-    configure_semaphore(
-        max_containers
-    )
+    # ------------------------------------------------------------------
+    # Sandbox
+    #
+    # ONE challenge = ONE active sandbox.
+    # ------------------------------------------------------------------
+
+    configure_semaphore(1)
 
     await cleanup_orphan_containers()
 
@@ -486,17 +516,21 @@ async def _run_single(
             f"[red]No metadata.yml found in "
             f"{challenge_dir}[/red]"
         )
-        sys.exit(1)
+        return
 
     meta = ChallengeMeta.from_yaml(
         meta_path
     )
 
     console.print(
-        f"[bold]Challenge:[/bold] "
+        f"\n[bold]Challenge:[/bold] "
         f"{meta.name} "
         f"({meta.category}, {meta.value} pts)"
     )
+
+    # ------------------------------------------------------------------
+    # CTFd
+    # ------------------------------------------------------------------
 
     ctfd = CTFdClient(
         base_url=settings.ctfd_url,
@@ -507,46 +541,80 @@ async def _run_single(
 
     cost_tracker = CostTracker()
 
-    # ---------------------------------------------------------------
-    # Preserve operator information.
-    #
-    # ChallengeSwarm will need to forward these values to Solver.
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Create ONE solver
+    # ------------------------------------------------------------------
 
-    object.__setattr__(
-        settings,
-        "solver_description",
-        description.strip(),
-    )
-
-    object.__setattr__(
-        settings,
-        "solver_hint",
-        hint.strip(),
-    )
-
-    object.__setattr__(
-        settings,
-        "solver_evidence",
-        evidence,
-    )
-
-    swarm = ChallengeSwarm(
-        challenge_dir=str(
-            challenge_path
-        ),
+    solver = Solver(
+        model_spec=model_spec,
+        challenge_dir=str(challenge_path),
         meta=meta,
         ctfd=ctfd,
         cost_tracker=cost_tracker,
         settings=settings,
-        model_specs=model_specs,
-        no_submit=no_submit,
     )
 
-    try:
-        result = await swarm.run()
+    # ------------------------------------------------------------------
+    # Configure solver dependencies
+    # ------------------------------------------------------------------
 
-        from backend.solver_base import FLAG_FOUND
+    solver.deps.no_submit = no_submit
+
+    solver.deps.model_spec = model_spec
+
+    async def submit_flag(flag: str):
+        """Submit a flag through CTFd."""
+
+        if no_submit:
+            return "Dry-run mode: flag submission disabled."
+
+        result = await ctfd.submit_flag(
+            meta.name,
+            flag,
+        )
+
+        return result.display
+
+    solver.deps.submit_fn = submit_flag
+
+    # ------------------------------------------------------------------
+    # RUN
+    #
+    # This is the actual performing process:
+    #
+    # Solver.start()
+    #      ↓
+    # PydanticAI
+    #      ↓
+    # LLM
+    #      ↓
+    # tools
+    #      ↓
+    # investigation
+    #      ↓
+    # flag
+    # ------------------------------------------------------------------
+
+    try:
+        console.print(
+            "\n[bold cyan]"
+            "Starting ONE solver..."
+            "[/bold cyan]"
+        )
+
+        console.print(
+            "[dim]"
+            "The solver will autonomously inspect, "
+            "execute tools, investigate, and attempt "
+            "to obtain the flag."
+            "[/dim]\n"
+        )
+
+        result = await solver.run_until_done_or_gave_up()
+
+        # --------------------------------------------------------------
+        # Result
+        # --------------------------------------------------------------
 
         if (
             result
@@ -562,9 +630,56 @@ async def _run_single(
         else:
             console.print(
                 "\n[bold red]"
-                "No flag found."
+                "No confirmed flag found."
                 "[/bold red]"
             )
+
+            if result and result.flag:
+                console.print(
+                    f"[yellow]Candidate:[/yellow] "
+                    f"{result.flag}"
+                )
+
+        # --------------------------------------------------------------
+        # Solver information
+        # --------------------------------------------------------------
+
+        if result:
+            console.print(
+                "\n[bold]Solver Result[/bold]"
+            )
+
+            console.print(
+                f"  Status: {result.status}"
+            )
+
+            console.print(
+                f"  Steps: {result.step_count}"
+            )
+
+            console.print(
+                f"  Cost: ${result.cost_usd:.4f}"
+            )
+
+            if result.findings_summary:
+                console.print(
+                    "\n[bold]Findings:[/bold]"
+                )
+                console.print(
+                    result.findings_summary
+                )
+
+            if result.log_path:
+                console.print(
+                    "\n[bold]Trace:[/bold]"
+                )
+                console.print(
+                    f"  {result.log_path}"
+                )
+
+        # --------------------------------------------------------------
+        # Cost
+        # --------------------------------------------------------------
 
         console.print(
             "\n[bold]Cost Summary:[/bold]"
@@ -579,26 +694,31 @@ async def _run_single(
 
         console.print(
             "  [bold]"
-            f"Total: ${cost_tracker.total_cost_usd:.2f}"
+            f"Total: ${cost_tracker.total_cost_usd:.4f}"
             "[/bold]"
         )
 
     finally:
+        await solver.stop()
         await ctfd.close()
+
+
+# ============================================================================
+# INTERACTIVE SINGLE CHALLENGE
+# ============================================================================
 
 
 async def _run_interactive(
     settings: Settings,
-    model_specs: list[str],
+    model_spec: str,
     no_submit: bool,
-    max_challenges: int,
     description: str,
     hint: str,
     evidence: list[str],
 ) -> None:
-    """Run the solver using operator-provided challenge information."""
+    """Run exactly one interactive CTF challenge with one Solver."""
 
-    from backend.agents.swarm import ChallengeSwarm
+    from backend.agents.solver import Solver
     from backend.cost_tracker import CostTracker
     from backend.ctfd import CTFdClient
     from backend.prompts import ChallengeMeta
@@ -606,24 +726,11 @@ async def _run_interactive(
         cleanup_orphan_containers,
         configure_semaphore,
     )
+    from backend.solver_base import FLAG_FOUND
 
-    # ---------------------------------------------------------------
-    # Sandbox concurrency
-    # ---------------------------------------------------------------
-
-    max_containers = (
-        max_challenges * len(model_specs)
-    )
-
-    configure_semaphore(
-        max_containers
-    )
-
-    await cleanup_orphan_containers()
-
-    # ---------------------------------------------------------------
-    # Display operator input
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Display challenge
+    # ------------------------------------------------------------------
 
     console.print(
         Panel(
@@ -641,14 +748,25 @@ async def _run_interactive(
                 if evidence
                 else "(none)"
             ),
-            title="Solver Input",
+            title="ONE-AGENT SOLVER",
             border_style="green",
         )
     )
 
-    # ---------------------------------------------------------------
-    # Build an in-memory ChallengeMeta
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Make operator information available to Solver
+    # ------------------------------------------------------------------
+
+    _configure_solver_context(
+        settings=settings,
+        description=description,
+        hint=hint,
+        evidence=evidence,
+    )
+
+    # ------------------------------------------------------------------
+    # Build interactive metadata
+    # ------------------------------------------------------------------
 
     meta = ChallengeMeta(
         name="interactive",
@@ -665,70 +783,21 @@ async def _run_interactive(
         solves=0,
     )
 
-    # ---------------------------------------------------------------
-    # Connect operator information to SolverDeps
-    #
-    # Solver currently reads the operator instruction from
-    # settings.solver_instruction.
-    #
-    # Keep the complete interactive input together so the model
-    # receives the actual operator context.
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # ONE sandbox
+    # ------------------------------------------------------------------
 
-    instruction_parts: list[str] = []
+    configure_semaphore(1)
 
-    if description.strip():
-        instruction_parts.append(
-            f"Operator challenge description:\n"
-            f"{description.strip()}"
-        )
+    await cleanup_orphan_containers()
 
-    if hint.strip():
-        instruction_parts.append(
-            f"Operator hint:\n"
-            f"{hint.strip()}"
-        )
-
-    if evidence:
-        instruction_parts.append(
-            "Operator-provided evidence paths:\n"
-            + "\n".join(
-                f"- {path}"
-                for path in evidence
-            )
-        )
-
-    object.__setattr__(
-        settings,
-        "solver_instruction",
-        "\n\n".join(
-            instruction_parts
-        ),
+    challenge_dir = str(
+        Path.cwd()
     )
 
-    # Preserve these fields too for compatibility with the existing
-    # single-challenge path and future evidence integration.
-    object.__setattr__(
-        settings,
-        "solver_description",
-        description.strip(),
-    )
-
-    object.__setattr__(
-        settings,
-        "solver_hint",
-        hint.strip(),
-    )
-
-    object.__setattr__(
-        settings,
-        "solver_evidence",
-        evidence,
-    )
-
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
     # CTFd
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     ctfd = CTFdClient(
         base_url=settings.ctfd_url,
@@ -739,41 +808,53 @@ async def _run_interactive(
 
     cost_tracker = CostTracker()
 
-    # ---------------------------------------------------------------
-    # Interactive challenge directory
-    #
-    # The solver expects a challenge_dir. For an interactive
-    # challenge there may be no distfiles, so use the project root.
-    #
-    # DockerSandbox will still start normally.
-    # ---------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # ONE Solver
+    # ------------------------------------------------------------------
 
-    challenge_dir = str(
-        Path.cwd()
-    )
-
-    # ---------------------------------------------------------------
-    # Swarm
-    # ---------------------------------------------------------------
-
-    swarm = ChallengeSwarm(
+    solver = Solver(
+        model_spec=model_spec,
         challenge_dir=challenge_dir,
         meta=meta,
         ctfd=ctfd,
         cost_tracker=cost_tracker,
         settings=settings,
-        model_specs=model_specs,
-        no_submit=no_submit,
     )
+
+    solver.deps.no_submit = no_submit
+    solver.deps.model_spec = model_spec
+
+    async def submit_flag(flag: str):
+        """Submit a flag through CTFd."""
+
+        if no_submit:
+            return "Dry-run mode: flag submission disabled."
+
+        result = await ctfd.submit_flag(
+            meta.name,
+            flag,
+        )
+
+        return result.display
+
+    solver.deps.submit_fn = submit_flag
+
+    # ------------------------------------------------------------------
+    # RUN ONE AGENT
+    # ------------------------------------------------------------------
 
     try:
         console.print(
-            "\n[bold cyan]Starting interactive solver swarm...[/bold cyan]"
+            "\n[bold cyan]"
+            "Starting ONE autonomous solver..."
+            "[/bold cyan]\n"
         )
 
-        result = await swarm.run()
+        result = await solver.run_until_done_or_gave_up()
 
-        from backend.solver_base import FLAG_FOUND
+        # ------------------------------------------------------------------
+        # Result
+        # ------------------------------------------------------------------
 
         if (
             result
@@ -785,82 +866,81 @@ async def _run_interactive(
                 "[/bold green] "
                 f"{result.flag}"
             )
+
         else:
             console.print(
                 "\n[bold red]"
-                "No flag found."
+                "No confirmed flag found."
                 "[/bold red]"
             )
 
-    finally:
-        await ctfd.close()
+            if result and result.flag:
+                console.print(
+                    f"[yellow]Candidate:[/yellow] "
+                    f"{result.flag}"
+                )
 
-# ============================================================================
-# COORDINATOR MESSAGE COMMAND
-# ============================================================================
+        # ------------------------------------------------------------------
+        # Details
+        # ------------------------------------------------------------------
 
-
-@click.command()
-@click.argument("message")
-@click.option(
-    "--port",
-    default=9400,
-    type=int,
-    help="Coordinator message port",
-)
-@click.option(
-    "--host",
-    default="127.0.0.1",
-    help="Coordinator host",
-)
-def msg(
-    message: str,
-    port: int,
-    host: str,
-) -> None:
-    """Send a message to the running coordinator."""
-
-    import json
-    import urllib.request
-
-    body = json.dumps(
-        {"message": message}
-    ).encode()
-
-    req = urllib.request.Request(
-        f"http://{host}:{port}/msg",
-        data=body,
-        headers={
-            "Content-Type": "application/json"
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(
-            req,
-            timeout=5,
-        ) as resp:
-            data = json.loads(
-                resp.read()
+        if result:
+            console.print(
+                "\n[bold]Solver Result[/bold]"
             )
 
             console.print(
-                "[green]Sent:[/green] "
-                f"{data.get('queued', message[:200])}"
+                f"  Status: {result.status}"
             )
 
-    except Exception as exc:
-        console.print(
-            "[red]Failed:[/red] "
-            f"{exc}"
-        )
+            console.print(
+                f"  Steps: {result.step_count}"
+            )
+
+            console.print(
+                f"  Cost: ${result.cost_usd:.4f}"
+            )
+
+            if result.findings_summary:
+                console.print(
+                    "\n[bold]Findings:[/bold]"
+                )
+                console.print(
+                    result.findings_summary
+                )
+
+            if result.log_path:
+                console.print(
+                    "\n[bold]Trace:[/bold]"
+                )
+                console.print(
+                    f"  {result.log_path}"
+                )
+
+        # ------------------------------------------------------------------
+        # Cost
+        # ------------------------------------------------------------------
 
         console.print(
-            "Is the coordinator running?"
+            "\n[bold]Cost Summary:[/bold]"
         )
 
-        sys.exit(1)
+        for agent_name in cost_tracker.by_agent:
+            console.print(
+                "  "
+                f"{agent_name}: "
+                f"{cost_tracker.format_usage(agent_name)}"
+            )
+
+        console.print(
+            "  [bold]"
+            f"Total: ${cost_tracker.total_cost_usd:.4f}"
+            "[/bold]"
+        )
+
+    finally:
+        await solver.stop()
+        await ctfd.close()
 
 
 # ============================================================================

@@ -39,7 +39,14 @@ from backend.models import (
 from backend.output_types import FlagFound
 from backend.prompts import ChallengeMeta, build_prompt, list_distfiles
 from backend.sandbox import DockerSandbox
-from backend.solver_base import CANCELLED, CORRECT_MARKERS, ERROR, FLAG_FOUND, GAVE_UP, SolverResult
+from backend.solver_base import (
+    CANCELLED,
+    CORRECT_MARKERS,
+    ERROR,
+    FLAG_FOUND,
+    GAVE_UP,
+    SolverResult,
+)
 from backend.tools.flag import submit_flag
 from backend.tools.sandbox import (
     bash,
@@ -59,109 +66,361 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# CLI / live execution helpers
+# ---------------------------------------------------------------------------
+
+
+def _shorten(value: Any, limit: int = 300) -> str:
+    """Create a compact representation for live CLI output."""
+
+    if value is None:
+        return ""
+
+    text = str(value).replace("\n", " ").strip()
+
+    if len(text) > limit:
+        return text[:limit] + "..."
+
+    return text
+
+
+def _format_tool_args(tool_args: dict[str, Any], limit: int = 500) -> str:
+    """Format tool arguments for readable live CLI output."""
+
+    if not tool_args:
+        return ""
+
+    parts: list[str] = []
+
+    for key, value in tool_args.items():
+        value_text = _shorten(value, 220)
+        parts.append(f"{key}={value_text!r}")
+
+    text = ", ".join(parts)
+
+    if len(text) > limit:
+        text = text[:limit] + "..."
+
+    return text
+
+
+# ---------------------------------------------------------------------------
 # TracingToolset
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class TracingToolset(WrapperToolset[SolverDeps]):
-    """Wraps a toolset with tracing, loop detection, and investigation state.
-
-    Extends the original tracing toolset with:
-    - Action deduplication (read-only actions only)
-    - Flag detection in arbitrary tool output
-    - Progress detection (NEW_INFORMATION / CONFIRMATION / FAILURE / NO_PROGRESS)
-    - Investigation state tracking and context injection
-    - Budget awareness
-    """
+    """Wrap a toolset with tracing, loop detection and live investigation state."""
 
     tracer: SolverTracer = field(repr=False)
     loop_detector: LoopDetector = field(repr=False)
     step_counter: list[int] = field(repr=False)
-    state: InvestigationState = field(default_factory=InvestigationState)
+
+    state: InvestigationState = field(
+        default_factory=InvestigationState
+    )
+
     request_budget: int = DEFAULT_REQUEST_BUDGET
 
     async def call_tool(
-        self, name: str, tool_args: dict[str, Any], ctx: RunContext[SolverDeps], tool: ToolsetTool[SolverDeps]
+        self,
+        name: str,
+        tool_args: dict[str, Any],
+        ctx: RunContext[SolverDeps],
+        tool: ToolsetTool[SolverDeps],
     ) -> Any:
+        """Execute a tool while exposing live solver activity."""
+
         self.step_counter[0] += 1
         step = self.step_counter[0]
 
-        self.tracer.tool_call(name, tool_args, step)
+        # ---------------------------------------------------------------
+        # LIVE STEP: before tool execution
+        # ---------------------------------------------------------------
 
-        # --- Action deduplication (read-only actions only) ---
-        normalized = normalize_action(name, tool_args)
-        if name != "submit_flag" and is_readonly_action(name, tool_args):
-            seen, prior_summary = self.state.has_action(normalized)
+        args_display = _format_tool_args(tool_args)
+
+        if args_display:
+            logger.info(
+                f"[step {step}] → {name}({args_display})"
+            )
+        else:
+            logger.info(
+                f"[step {step}] → {name}()"
+            )
+
+        self.tracer.tool_call(
+            name,
+            tool_args,
+            step,
+        )
+
+        # ---------------------------------------------------------------
+        # Action deduplication
+        # ---------------------------------------------------------------
+
+        normalized = normalize_action(
+            name,
+            tool_args,
+        )
+
+        if (
+            name != "submit_flag"
+            and is_readonly_action(name, tool_args)
+        ):
+            seen, prior_summary = self.state.has_action(
+                normalized
+            )
+
             if seen:
-                logger.debug(f"[state] dedup: {normalized} (step {step})")
-                self.tracer.event("dedup", tool=name, normalized=normalized, step=step)
-                return (
-                    f"[DEDUP] You already performed this equivalent action. "
-                    f"Prior result: {prior_summary[:200]}\n\n"
-                    "Try a DIFFERENT approach or move to your next objective."
+                logger.info(
+                    f"[step {step}] ↻ DEDUP: {name}"
                 )
 
-        # --- Loop detection (existing) ---
-        loop_status = self.loop_detector.check(name, tool_args)
+                self.tracer.event(
+                    "dedup",
+                    tool=name,
+                    normalized=normalized,
+                    step=step,
+                )
+
+                return (
+                    "[DEDUP] You already performed this "
+                    "equivalent action. "
+                    f"Prior result: {prior_summary[:200]}\n\n"
+                    "Try a DIFFERENT approach or move to your "
+                    "next objective."
+                )
+
+        # ---------------------------------------------------------------
+        # Loop detection
+        # ---------------------------------------------------------------
+
+        loop_status = self.loop_detector.check(
+            name,
+            tool_args,
+        )
+
         if loop_status == "break":
-            logger.warning(f"Loop break on {name} at step {step}")
-            self.tracer.event("loop_break", tool=name, step=step)
+            logger.warning(
+                f"[step {step}] LOOP BREAK: {name}"
+            )
+
+            self.tracer.event(
+                "loop_break",
+                tool=name,
+                step=step,
+            )
+
             return LOOP_WARNING_MESSAGE
 
-        # --- Execute tool ---
-        result = await self.wrapped.call_tool(name, tool_args, ctx, tool)
+        if loop_status == "warn":
+            logger.warning(
+                f"[step {step}] LOOP WARNING: {name}"
+            )
 
-        result_str = str(result) if result is not None else ""
-        self.tracer.tool_result(name, result_str, step)
+        # ---------------------------------------------------------------
+        # Execute actual tool
+        # ---------------------------------------------------------------
 
-        # --- Record action for future dedup ---
-        self.state.record_action(normalized, result_str)
-        self.state.tried.append(normalized)
+        try:
+            result = await self.wrapped.call_tool(
+                name,
+                tool_args,
+                ctx,
+                tool,
+            )
+        except Exception as exc:
+            logger.error(
+                f"[step {step}] ✗ {name}: {exc}"
+            )
 
-        # --- Flag detection in tool output ---
-        if name != "submit_flag" and isinstance(result, str):
-            flags = detect_flag_in_text(result)
+            self.tracer.event(
+                "tool_exception",
+                tool=name,
+                step=step,
+                error=str(exc),
+            )
+
+            raise
+
+        result_str = (
+            str(result)
+            if result is not None
+            else ""
+        )
+
+        self.tracer.tool_result(
+            name,
+            result_str,
+            step,
+        )
+
+        # ---------------------------------------------------------------
+        # LIVE STEP: after tool execution
+        # ---------------------------------------------------------------
+
+        result_preview = _shorten(
+            result_str,
+            350,
+        )
+
+        if name == "submit_flag":
+            if any(
+                marker in result_str
+                for marker in CORRECT_MARKERS
+            ):
+                logger.info(
+                    f"[step {step}] ✓ FLAG CONFIRMED"
+                )
+            else:
+                logger.info(
+                    f"[step {step}] ← submit_flag: "
+                    f"{result_preview}"
+                )
+        else:
+            logger.info(
+                f"[step {step}] ← {name}: "
+                f"{result_preview}"
+            )
+
+        # ---------------------------------------------------------------
+        # Record action
+        # ---------------------------------------------------------------
+
+        self.state.record_action(
+            normalized,
+            result_str,
+        )
+
+        self.state.tried.append(
+            normalized
+        )
+
+        # ---------------------------------------------------------------
+        # Flag detection
+        # ---------------------------------------------------------------
+
+        if (
+            name != "submit_flag"
+            and isinstance(result, str)
+        ):
+            flags = detect_flag_in_text(
+                result
+            )
+
             for flag in flags:
                 if flag not in self.state.flag_candidates:
-                    self.state.flag_candidates.append(flag)
-                    self.tracer.event("flag_detected", flag=flag, tool=name, step=step)
-                    logger.info(f"[flag] candidate: {flag} via {name} (step {step})")
+                    self.state.flag_candidates.append(
+                        flag
+                    )
 
-        # --- Progress detection ---
-        progress = self._categorize_progress(name, tool_args, result_str)
-        self.tracer.event("progress", tool=name, progress=progress, step=step)
-        logger.debug(f"[progress] {progress} for {name} (step {step})")
+                    self.tracer.event(
+                        "flag_detected",
+                        flag=flag,
+                        tool=name,
+                        step=step,
+                    )
 
-        # --- Update investigation state from result ---
-        self._update_state(name, tool_args, result_str, progress)
+                    logger.info(
+                        f"[step {step}] 🚩 FLAG CANDIDATE: "
+                        f"{flag}"
+                    )
 
-        # --- Inject loop warning alongside result on "warn" level (existing) ---
+        # ---------------------------------------------------------------
+        # Progress detection
+        # ---------------------------------------------------------------
+
+        progress = self._categorize_progress(
+            name,
+            tool_args,
+            result_str,
+        )
+
+        self.tracer.event(
+            "progress",
+            tool=name,
+            progress=progress,
+            step=step,
+        )
+
+        logger.info(
+            f"[step {step}] state={progress}"
+        )
+
+        # ---------------------------------------------------------------
+        # Update investigation state
+        # ---------------------------------------------------------------
+
+        self._update_state(
+            name,
+            tool_args,
+            result_str,
+            progress,
+        )
+
+        # ---------------------------------------------------------------
+        # Loop warning
+        # ---------------------------------------------------------------
+
         if loop_status == "warn":
-            result = f"{result}\n\n{LOOP_WARNING_MESSAGE}" if isinstance(result, str) else result
+            if isinstance(result, str):
+                result = (
+                    f"{result}\n\n"
+                    f"{LOOP_WARNING_MESSAGE}"
+                )
 
-        # --- Check for confirmed flag (existing) ---
-        if name == "submit_flag" and any(m in result_str for m in CORRECT_MARKERS):
-            self.tracer.event("flag_confirmed", tool=name, step=step)
+        # ---------------------------------------------------------------
+        # Confirmed flag
+        # ---------------------------------------------------------------
 
-        # --- Inject state context and warnings every 3 steps ---
-        if step % 3 == 0 and isinstance(result, str):
-            remaining = max(0, self.request_budget - self.step_counter[0])
+        if (
+            name == "submit_flag"
+            and any(
+                marker in result_str
+                for marker in CORRECT_MARKERS
+            )
+        ):
+            self.tracer.event(
+                "flag_confirmed",
+                tool=name,
+                step=step,
+            )
 
-            # Flag detection urgency — always inject if candidates exist
+        # ---------------------------------------------------------------
+        # State / budget context
+        # ---------------------------------------------------------------
+
+        if (
+            step % 3 == 0
+            and isinstance(result, str)
+        ):
+            remaining = max(
+                0,
+                self.request_budget
+                - self.step_counter[0],
+            )
+
+            # Flag candidates
             if self.state.flag_candidates:
                 result += (
-                    f"\n\n**FLAG CANDIDATE(S)**: "
+                    "\n\n**FLAG CANDIDATE(S)**: "
                     f"{', '.join(self.state.flag_candidates)}\n"
-                    "Call `submit_flag` with the most likely candidate NOW."
-                )
-            elif remaining <= 5 and remaining > 0:
-                result += (
-                    f"\n\n**BUDGET WARNING**: ~{remaining} requests remaining. "
-                    f"Focus on: {self.state.objective or 'your current best lead'}."
+                    "Call `submit_flag` with the most "
+                    "likely candidate NOW."
                 )
 
-            # No-progress streak warning
+            # Budget warning
+            elif remaining <= 5 and remaining > 0:
+                result += (
+                    "\n\n**BUDGET WARNING**: "
+                    f"~{remaining} requests remaining. "
+                    "Focus on: "
+                    f"{self.state.objective or 'your current best lead'}."
+                )
+
+            # No-progress warning
             if self.state.no_progress_streak >= 3:
                 result += (
                     "\n\n**NO PROGRESS** for multiple actions. "
@@ -169,129 +428,335 @@ class TracingToolset(WrapperToolset[SolverDeps]):
                     "Try a fundamentally different approach."
                 )
 
-            # Compact state context
-            result += f"\n\n---\n{build_state_context(self.state, remaining)}"
-            self.tracer.event("state_injected", step=step)
+            # IMPORTANT:
+            # Build the state context separately.
+            # This avoids the broken nested f-string that caused:
+            #
+            # SyntaxError: f-string: expecting '}'
+            state_context = build_state_context(
+                self.state,
+                remaining,
+            )
 
-        # --- Inject findings from siblings (existing, every 5 steps) ---
-        if step % 5 == 0 and ctx.deps.message_bus and isinstance(result, str):
-            from backend.tools.core import do_check_findings
+            result += (
+                "\n\n---\n"
+                + state_context
+            )
 
-            findings_text = await do_check_findings(ctx.deps.message_bus, ctx.deps.model_spec)
-            if findings_text and "No new findings" not in findings_text:
-                result = f"{result}\n\n---\n{findings_text}"
-                self.tracer.event("findings_injected", step=step)
+            self.tracer.event(
+                "state_injected",
+                step=step,
+            )
+
+        # ---------------------------------------------------------------
+        # Sibling findings
+        # ---------------------------------------------------------------
+
+        if (
+            step % 5 == 0
+            and ctx.deps.message_bus
+            and isinstance(result, str)
+        ):
+            from backend.tools.core import (
+                do_check_findings,
+            )
+
+            findings_text = await do_check_findings(
+                ctx.deps.message_bus,
+                ctx.deps.model_spec,
+            )
+
+            if (
+                findings_text
+                and "No new findings" not in findings_text
+            ):
+                result = (
+                    f"{result}\n\n---\n"
+                    f"{findings_text}"
+                )
+
+                self.tracer.event(
+                    "findings_injected",
+                    step=step,
+                )
+
+                logger.info(
+                    f"[step {step}] ← sibling findings received"
+                )
 
         return result
 
-    # -- Progress detection --
+    # -------------------------------------------------------------------
+    # Progress detection
+    # -------------------------------------------------------------------
 
     def _categorize_progress(
-        self, tool_name: str, args: dict[str, Any], result: str
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: str,
     ) -> str:
-        """Categorize a tool result as NEW_INFORMATION, CONFIRMATION, FAILURE, or NO_PROGRESS."""
-        if not result or result in ("(no output)", ""):
+        """Categorize a tool result."""
+
+        if not result or result in (
+            "(no output)",
+            "",
+        ):
             return "NO_PROGRESS"
 
         error_indicators = [
-            "error", "failed", "denied", "forbidden", "403", "404",
-            "500", "command not found", "no such file", "permission denied",
-            "connection refused", "timeout",
+            "error",
+            "failed",
+            "denied",
+            "forbidden",
+            "403",
+            "404",
+            "500",
+            "command not found",
+            "no such file",
+            "permission denied",
+            "connection refused",
+            "timeout",
         ]
+
         result_lower = result.lower()
-        error_count = sum(1 for e in error_indicators if e in result_lower)
 
-        if error_count >= 2 and len(result) < 500:
-            return "FAILURE"
-        if error_count >= 1 and len(result) < 100:
+        error_count = sum(
+            1
+            for error in error_indicators
+            if error in result_lower
+        )
+
+        if (
+            error_count >= 2
+            and len(result) < 500
+        ):
             return "FAILURE"
 
-        has_flag = bool(detect_flag_in_text(result))
+        if (
+            error_count >= 1
+            and len(result) < 100
+        ):
+            return "FAILURE"
+
+        has_flag = bool(
+            detect_flag_in_text(result)
+        )
+
         if has_flag:
             return "NEW_INFORMATION"
 
-        has_new_urls = bool(re.findall(r'https?://[^\s<>"\'\']+', result))
-        has_new_endpoints = bool(re.findall(
-            r'/(?:api|admin|upload|flag|debug|backup|config|\.env|\.git)',
-            result_lower,
-        ))
-        if has_new_urls or has_new_endpoints:
+        has_new_urls = bool(
+            re.findall(
+                r'https?://[^\s<>"\']+',
+                result,
+            )
+        )
+
+        has_new_endpoints = bool(
+            re.findall(
+                r'/(?:api|admin|upload|flag|debug|backup|config|\.env|\.git)',
+                result_lower,
+            )
+        )
+
+        if (
+            has_new_urls
+            or has_new_endpoints
+        ):
             return "NEW_INFORMATION"
 
         if len(result) > 100:
             for discovery in self.state.discoveries:
-                if discovery.lower() in result_lower and len(result) < 300:
+                if (
+                    discovery.lower()
+                    in result_lower
+                    and len(result) < 300
+                ):
                     return "CONFIRMATION"
+
             return "NEW_INFORMATION"
 
         return "NO_PROGRESS"
 
-    # -- State update from result --
+    # -------------------------------------------------------------------
+    # Investigation state
+    # -------------------------------------------------------------------
 
     def _update_state(
-        self, tool_name: str, args: dict[str, Any], result: str, progress: str
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        result: str,
+        progress: str,
     ) -> None:
-        """Update investigation state based on tool result."""
+        """Update investigation state from tool output."""
+
         if progress == "NEW_INFORMATION":
-            # Extract endpoints
-            for url in re.findall(r'https?://[^\s<>"\'\']+', result):
+
+            # -----------------------------------------------------------
+            # URLs
+            # -----------------------------------------------------------
+
+            for url in re.findall(
+                r'https?://[^\s<>"\']+',
+                result,
+            ):
                 self.state.add_endpoint(url)
 
-            # Detect technologies
+            # -----------------------------------------------------------
+            # Technologies
+            # -----------------------------------------------------------
+
             tech_patterns = {
-                "PHP": r"\bPHP\b", "Python": r"\bPython\b",
-                "Flask": r"\bFlask\b", "Django": r"\bDjango\b",
-                "Nginx": r"\bNginx\b", "Apache": r"\bApache\b",
-                "MySQL": r"\bMySQL\b", "SQLite": r"\bSQLite\b",
-                "RSA": r"\bRSA\b", "AES": r"\bAES\b",
+                "PHP": r"\bPHP\b",
+                "Python": r"\bPython\b",
+                "Flask": r"\bFlask\b",
+                "Django": r"\bDjango\b",
+                "Nginx": r"\bNginx\b",
+                "Apache": r"\bApache\b",
+                "MySQL": r"\bMySQL\b",
+                "SQLite": r"\bSQLite\b",
+                "RSA": r"\bRSA\b",
+                "AES": r"\bAES\b",
                 "Docker": r"\bDocker\b",
             }
+
             for tech, pattern in tech_patterns.items():
-                if re.search(pattern, result) and tech not in self.state.technologies:
-                    self.state.technologies.append(tech)
+                if (
+                    re.search(
+                        pattern,
+                        result,
+                    )
+                    and tech not in self.state.technologies
+                ):
+                    self.state.technologies.append(
+                        tech
+                    )
 
-            # Detect upload functionality
-            if any(kw in result.lower()
-                   for kw in ("upload", "uploaded", "file uploaded")):
-                self.state.add_discovery("Upload functionality detected")
+                    logger.info(
+                        f"[state] technology={tech}"
+                    )
 
-            # Detect SQL errors
-            if "sql" in result.lower() and "error" in result.lower():
-                self.state.add_discovery("SQL error detected — possible SQLi")
+            # -----------------------------------------------------------
+            # Upload functionality
+            # -----------------------------------------------------------
+
+            if any(
+                keyword in result.lower()
+                for keyword in (
+                    "upload",
+                    "uploaded",
+                    "file uploaded",
+                )
+            ):
+                self.state.add_discovery(
+                    "Upload functionality detected"
+                )
+
+                logger.info(
+                    "[state] discovery=Upload functionality detected"
+                )
+
+            # -----------------------------------------------------------
+            # SQL errors
+            # -----------------------------------------------------------
+
+            if (
+                "sql" in result.lower()
+                and "error" in result.lower()
+            ):
+                self.state.add_discovery(
+                    "SQL error detected — possible SQLi"
+                )
+
+                logger.info(
+                    "[state] discovery=Possible SQLi"
+                )
 
         elif progress == "FAILURE":
-            norm = normalize_action(tool_name, args)
-            if norm not in self.state.failed:
-                self.state.failed.append(norm)
+
+            normalized = normalize_action(
+                tool_name,
+                args,
+            )
+
+            if normalized not in self.state.failed:
+                self.state.failed.append(
+                    normalized
+                )
 
         elif progress == "NO_PROGRESS":
+
             self.state.increment_no_progress()
 
-        # Track uploaded files
-        if tool_name == "write_file":
-            path = args.get("path", "")
-            if path and path not in self.state.uploaded_files:
-                self.state.uploaded_files.append(path)
+        # ---------------------------------------------------------------
+        # Uploaded files
+        # ---------------------------------------------------------------
 
-        # Any state-changing action may invalidate prior read-only observations
+        if tool_name == "write_file":
+            path = args.get(
+                "path",
+                "",
+            )
+
+            if (
+                path
+                and path not in self.state.uploaded_files
+            ):
+                self.state.uploaded_files.append(
+                    path
+                )
+
+        # ---------------------------------------------------------------
+        # Invalidate read cache after state changes
+        # ---------------------------------------------------------------
+
         if tool_name == "write_file":
             self.state._action_cache.clear()
-        elif tool_name == "bash" and not is_readonly_action(tool_name, args):
+
+        elif (
+            tool_name == "bash"
+            and not is_readonly_action(
+                tool_name,
+                args,
+            )
+        ):
             self.state._action_cache.clear()
 
 
 # ---------------------------------------------------------------------------
-# Toolset builder (unchanged)
+# Toolset builder
 # ---------------------------------------------------------------------------
 
 
-def _build_toolset(deps: SolverDeps) -> FunctionToolset[SolverDeps]:
+def _build_toolset(
+    deps: SolverDeps,
+) -> FunctionToolset[SolverDeps]:
     """Build the raw toolset for a solver agent."""
-    tools = [bash, read_file, write_file, list_files, submit_flag, web_fetch,
-             webhook_create, webhook_get_requests, check_findings, notify_coordinator]
+
+    tools = [
+        bash,
+        read_file,
+        write_file,
+        list_files,
+        submit_flag,
+        web_fetch,
+        webhook_create,
+        webhook_get_requests,
+        check_findings,
+        notify_coordinator,
+    ]
+
     if deps.use_vision:
-        tools.append(view_image)
-    return FunctionToolset(tools=tools, max_retries=4)
+        tools.append(
+            view_image
+        )
+
+    return FunctionToolset(
+        tools=tools,
+        max_retries=4,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,22 +779,51 @@ class Solver:
         sandbox: DockerSandbox | None = None,
         owns_sandbox: bool | None = None,
     ) -> None:
+
         self.model_spec = model_spec
-        self.model_id = model_id_from_spec(model_spec)
+
+        self.model_id = model_id_from_spec(
+            model_spec
+        )
+
         self.challenge_dir = challenge_dir
         self.meta = meta
         self.ctfd = ctfd
         self.cost_tracker = cost_tracker
         self.settings = settings
-        self.cancel_event = cancel_event or asyncio.Event()
-        self._owns_sandbox = owns_sandbox if owns_sandbox is not None else (sandbox is None)
 
-        self.sandbox = sandbox or DockerSandbox(
-            image=getattr(settings, "sandbox_image", "ctf-sandbox"),
-            challenge_dir=challenge_dir,
-            memory_limit=getattr(settings, "container_memory_limit", "4g"),
+        self.cancel_event = (
+            cancel_event
+            or asyncio.Event()
         )
-        self.use_vision = supports_vision(model_spec)
+
+        self._owns_sandbox = (
+            owns_sandbox
+            if owns_sandbox is not None
+            else sandbox is None
+        )
+
+        self.sandbox = (
+            sandbox
+            or DockerSandbox(
+                image=getattr(
+                    settings,
+                    "sandbox_image",
+                    "ctf-sandbox",
+                ),
+                challenge_dir=challenge_dir,
+                memory_limit=getattr(
+                    settings,
+                    "container_memory_limit",
+                    "4g",
+                ),
+            )
+        )
+
+        self.use_vision = supports_vision(
+            model_spec
+        )
+
         self.deps = SolverDeps(
             sandbox=self.sandbox,
             ctfd=ctfd,
@@ -339,35 +833,91 @@ class Solver:
             use_vision=self.use_vision,
             cost_tracker=cost_tracker,
         )
+
         self.loop_detector = LoopDetector()
-        self.tracer = SolverTracer(meta.name, self.model_id)
-        self.agent_name = f"{meta.name}/{self.model_id}"
-        self._agent: Agent[SolverDeps, FlagFound] | None = None
+
+        self.tracer = SolverTracer(
+            meta.name,
+            self.model_id,
+        )
+
+        self.agent_name = (
+            f"{meta.name}/{self.model_id}"
+        )
+
+        self._agent: Agent[
+            SolverDeps,
+            FlagFound,
+        ] | None = None
+
         self._messages: list = []
-        self._step_count = [0]  # mutable ref shared with TracingToolset
+
+        # Shared mutable counter used by TracingToolset.
+        self._step_count = [0]
+
         self._flag: str | None = None
-        self._confirmed: bool = False
-        self._findings: str = ""
-        # --- Investigation state and budget ---
-        self.investigation = InvestigationState()
-        self.request_budget = DEFAULT_REQUEST_BUDGET
+        self._confirmed = False
+        self._findings = ""
+
+        self.investigation = (
+            InvestigationState()
+        )
+
+        self.request_budget = (
+            DEFAULT_REQUEST_BUDGET
+        )
+
+    # -------------------------------------------------------------------
+    # Start
+    # -------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the sandbox and build the agent."""
+        """Start sandbox and construct the agent."""
+
         if not self.sandbox._container:
             await self.sandbox.start()
-        self.deps.workspace_dir = self.sandbox.workspace_dir
 
-        arch_result = await self.sandbox.exec("uname -m", timeout_s=10)
-        container_arch = arch_result.stdout.strip() or "unknown"
+        self.deps.workspace_dir = (
+            self.sandbox.workspace_dir
+        )
 
-        distfile_names = list_distfiles(self.challenge_dir)
+        arch_result = await self.sandbox.exec(
+            "uname -m",
+            timeout_s=10,
+        )
 
-        # --- Challenge classification ---
-        category = classify_challenge(self.meta, distfile_names)
-        self.investigation.category = category
-        self.investigation.target = extract_target(self.meta.connection_info)
-        logger.info(f"[state] category={category} target={self.investigation.target}")
+        container_arch = (
+            arch_result.stdout.strip()
+            or "unknown"
+        )
+
+        distfile_names = list_distfiles(
+            self.challenge_dir
+        )
+
+        # ---------------------------------------------------------------
+        # Challenge classification
+        # ---------------------------------------------------------------
+
+        category = classify_challenge(
+            self.meta,
+            distfile_names,
+        )
+
+        self.investigation.category = (
+            category
+        )
+
+        self.investigation.target = (
+            extract_target(
+                self.meta.connection_info
+            )
+        )
+
+        logger.info(
+            f"[state] category={category} "
+            f"target={self.investigation.target}"
+        )
 
         system_prompt = build_prompt(
             self.meta,
@@ -376,9 +926,21 @@ class Solver:
             category_hint=category,
         )
 
-        model = resolve_model(self.model_spec, self.settings)
-        model_settings = resolve_model_settings(self.model_spec)
-        raw_toolset = _build_toolset(self.deps)
+        model = resolve_model(
+            self.model_spec,
+            self.settings,
+        )
+
+        model_settings = (
+            resolve_model_settings(
+                self.model_spec
+            )
+        )
+
+        raw_toolset = _build_toolset(
+            self.deps
+        )
+
         toolset = TracingToolset(
             wrapped=raw_toolset,
             tracer=self.tracer,
@@ -397,157 +959,508 @@ class Solver:
             output_type=FlagFound,
         )
 
-        self.tracer.event("start", challenge=self.meta.name, model=self.model_id)
-        logger.info(f"[{self.agent_name}] Solver started (category={category})")
+        self.tracer.event(
+            "start",
+            challenge=self.meta.name,
+            model=self.model_id,
+        )
 
-    async def run_until_done_or_gave_up(self) -> SolverResult:
-        """Run the solver loop until flag found, gave up, or cancelled."""
+        logger.info(
+            f"[{self.agent_name}] "
+            f"Solver started "
+            f"(category={category})"
+        )
+
+    # -------------------------------------------------------------------
+    # Main run
+    # -------------------------------------------------------------------
+
+    async def run_until_done_or_gave_up(
+        self,
+    ) -> SolverResult:
+        """Run until flag found, budget exhausted, or cancelled."""
+
         if not self._agent:
             await self.start()
+
         assert self._agent is not None
 
-        from pydantic_ai.exceptions import UsageLimitExceeded
-        from pydantic_ai.usage import UsageLimits
+        from pydantic_ai.exceptions import (
+            UsageLimitExceeded,
+        )
+
+        from pydantic_ai.usage import (
+            UsageLimits,
+        )
 
         t0 = time.monotonic()
 
+        logger.info(
+            "============================================================"
+        )
+
+        logger.info(
+            f"[solver] Starting autonomous run "
+            f"with budget={self.request_budget}"
+        )
+
+        logger.info(
+            "============================================================"
+        )
+
         try:
+
             result = await self._agent.run(
-                "Solve this CTF challenge." if not self._messages else "Continue solving.",
+                (
+                    "Solve this CTF challenge."
+                    if not self._messages
+                    else "Continue solving."
+                ),
                 deps=self.deps,
-                message_history=self._messages if self._messages else None,
-                usage_limits=UsageLimits(request_limit=self.request_budget),
+                message_history=(
+                    self._messages
+                    if self._messages
+                    else None
+                ),
+                usage_limits=UsageLimits(
+                    request_limit=self.request_budget
+                ),
             )
 
-            duration = time.monotonic() - t0
-            usage = result.usage()
+            duration = (
+                time.monotonic()
+                - t0
+            )
+
+            usage = result.usage
+
+            # -----------------------------------------------------------
+            # Cost tracking
+            # -----------------------------------------------------------
 
             self.cost_tracker.record(
-                self.agent_name, usage, self.model_id,
-                provider_spec=provider_from_spec(self.model_spec),
+                self.agent_name,
+                usage,
+                self.model_id,
+                provider_spec=provider_from_spec(
+                    self.model_spec
+                ),
                 duration_seconds=duration,
             )
 
-            agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
-            self.tracer.usage(
-                usage.input_tokens, usage.output_tokens,
-                usage.cache_read_tokens,
-                agent_usage.cost_usd if agent_usage else 0.0,
+            agent_usage = (
+                self.cost_tracker.by_agent.get(
+                    self.agent_name
+                )
             )
 
-            self._messages = result.all_messages()
+            self.tracer.usage(
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                (
+                    agent_usage.cost_usd
+                    if agent_usage
+                    else 0.0
+                ),
+            )
 
-            # Trace model responses from new messages
-            from pydantic_ai.messages import ModelResponse, TextPart
+            self._messages = (
+                result.all_messages()
+            )
+
+            # -----------------------------------------------------------
+            # Trace model responses
+            # -----------------------------------------------------------
+
+            from pydantic_ai.messages import (
+                ModelResponse,
+                TextPart,
+            )
+
             for msg in result.new_messages():
-                if isinstance(msg, ModelResponse):
-                    text_parts = [p.content for p in msg.parts if isinstance(p, TextPart)]
-                    text = " ".join(text_parts)
-                    msg_usage = msg.usage
-                    self.tracer.model_response(
-                        text[:500], self._step_count[0],
-                        input_tokens=msg_usage.input_tokens if msg_usage else 0,
-                        output_tokens=msg_usage.output_tokens if msg_usage else 0,
+
+                if isinstance(
+                    msg,
+                    ModelResponse,
+                ):
+
+                    text_parts = [
+                        part.content
+                        for part in msg.parts
+                        if isinstance(
+                            part,
+                            TextPart,
+                        )
+                    ]
+
+                    text = " ".join(
+                        text_parts
                     )
 
+                    msg_usage = msg.usage
+
+                    self.tracer.model_response(
+                        text[:500],
+                        self._step_count[0],
+                        input_tokens=(
+                            msg_usage.input_tokens
+                            if msg_usage
+                            else 0
+                        ),
+                        output_tokens=(
+                            msg_usage.output_tokens
+                            if msg_usage
+                            else 0
+                        ),
+                    )
+
+            # -----------------------------------------------------------
+            # Structured output
+            # -----------------------------------------------------------
+
             output = result.output
-            if isinstance(output, FlagFound):
+
+            if isinstance(
+                output,
+                FlagFound,
+            ):
+
                 self._flag = output.flag
-                self._findings = f"Flag found via {output.method}: {self._flag}"
-                # In dry-run mode, structured output is sufficient (can't verify via CTFd)
+
+                self._findings = (
+                    f"Flag found via "
+                    f"{output.method}: "
+                    f"{self._flag}"
+                )
+
+                logger.info(
+                    f"[solver] Model reported flag: "
+                    f"{self._flag}"
+                )
+
                 if self.deps.no_submit:
                     self._confirmed = True
-            # CTFd confirmation always counts (the primary path when not in dry-run)
-            if self.deps.confirmed_flag:
-                self._confirmed = True
-                self._flag = self._flag or self.deps.confirmed_flag
 
-            # Check for flag candidates detected during investigation
-            if not self._confirmed and self.investigation.flag_candidates:
-                best = self.investigation.flag_candidates[-1]
+            # -----------------------------------------------------------
+            # Confirmed by submit_flag
+            # -----------------------------------------------------------
+
+            if self.deps.confirmed_flag:
+
+                self._confirmed = True
+
+                self._flag = (
+                    self._flag
+                    or self.deps.confirmed_flag
+                )
+
+                logger.info(
+                    f"[solver] Confirmed flag: "
+                    f"{self.deps.confirmed_flag}"
+                )
+
+            # -----------------------------------------------------------
+            # Investigation candidates
+            # -----------------------------------------------------------
+
+            if (
+                not self._confirmed
+                and self.investigation.flag_candidates
+            ):
+
+                best = (
+                    self.investigation.flag_candidates[-1]
+                )
+
                 self._flag = best
-                self._findings = f"Flag candidate from investigation: {best}"
 
-            if self._confirmed and self._flag:
-                return self._result(FLAG_FOUND)
-            return self._result(GAVE_UP)
+                self._findings = (
+                    "Flag candidate from "
+                    f"investigation: {best}"
+                )
 
-        except UsageLimitExceeded as e:
-            logger.warning(f"[{self.agent_name}] Budget exhausted: {e}")
+                logger.info(
+                    f"[solver] Candidate preserved: "
+                    f"{best}"
+                )
+
+            # -----------------------------------------------------------
+            # Final result
+            # -----------------------------------------------------------
+
+            if (
+                self._confirmed
+                and self._flag
+            ):
+                logger.info(
+                    "[solver] FLAG FOUND"
+                )
+
+                return self._result(
+                    FLAG_FOUND
+                )
+
+            logger.info(
+                "[solver] Solver finished without "
+                "confirmed flag"
+            )
+
+            return self._result(
+                GAVE_UP
+            )
+
+        # ---------------------------------------------------------------
+        # Usage limit
+        # ---------------------------------------------------------------
+
+        except UsageLimitExceeded as exc:
+
+            logger.warning(
+                f"[{self.agent_name}] "
+                f"Budget exhausted: {exc}"
+            )
+
             if self.deps.confirmed_flag:
+
                 self._confirmed = True
-                self._flag = self._flag or self.deps.confirmed_flag
-            if not self._confirmed and self.investigation.flag_candidates:
-                self._flag = self.investigation.flag_candidates[-1]
-                self._findings = f"Flag candidate (budget exhausted): {self._flag}"
+
+                self._flag = (
+                    self._flag
+                    or self.deps.confirmed_flag
+                )
+
+            if (
+                not self._confirmed
+                and self.investigation.flag_candidates
+            ):
+
+                self._flag = (
+                    self.investigation.flag_candidates[-1]
+                )
+
+                self._findings = (
+                    "Flag candidate "
+                    "(budget exhausted): "
+                    f"{self._flag}"
+                )
+
             elif not self._findings:
-                self._findings = f"Budget exhausted after {self._step_count[0]} tool calls"
-            return self._result(GAVE_UP)
-        except asyncio.CancelledError:
-            if self.deps.confirmed_flag:
-                self._confirmed = True
-                self._flag = self._flag or self.deps.confirmed_flag
-            # Preserve flag candidates even on cancellation
-            if self.investigation.flag_candidates:
-                self._flag = self.investigation.flag_candidates[-1]
-                self._findings = f"Flag candidate (cancelled): {self._flag}"
-            return self._result(CANCELLED)
-        except Exception as e:
-            if self.deps.confirmed_flag:
-                self._confirmed = True
-                self._flag = self._flag or self.deps.confirmed_flag
-            logger.error(f"[{self.agent_name}] Error: {e}", exc_info=True)
-            self._findings = f"Error: {e}"
-            self.tracer.event("error", error=str(e))
-            # Preserve flag candidates even on error
-            if self.investigation.flag_candidates:
-                self._flag = self.investigation.flag_candidates[-1]
-                self._findings = f"Flag candidate (error): {self._flag}"
-            return self._result(ERROR)
 
-    def bump(self, insights: str) -> None:
-        """Inject insights from siblings and prepare to resume."""
-        # Include investigation state in the bump message so the model
-        # retains its discoveries after a restart.
+                self._findings = (
+                    "Budget exhausted after "
+                    f"{self._step_count[0]} "
+                    "tool calls"
+                )
+
+            return self._result(
+                GAVE_UP
+            )
+
+        # ---------------------------------------------------------------
+        # Cancellation
+        # ---------------------------------------------------------------
+
+        except asyncio.CancelledError:
+
+            logger.warning(
+                f"[{self.agent_name}] "
+                "Solver cancelled"
+            )
+
+            if self.deps.confirmed_flag:
+
+                self._confirmed = True
+
+                self._flag = (
+                    self._flag
+                    or self.deps.confirmed_flag
+                )
+
+            if self.investigation.flag_candidates:
+
+                self._flag = (
+                    self.investigation.flag_candidates[-1]
+                )
+
+                self._findings = (
+                    "Flag candidate "
+                    "(cancelled): "
+                    f"{self._flag}"
+                )
+
+            return self._result(
+                CANCELLED
+            )
+
+        # ---------------------------------------------------------------
+        # Unexpected error
+        # ---------------------------------------------------------------
+
+        except Exception as exc:
+
+            if self.deps.confirmed_flag:
+
+                self._confirmed = True
+
+                self._flag = (
+                    self._flag
+                    or self.deps.confirmed_flag
+                )
+
+            logger.error(
+                f"[{self.agent_name}] "
+                f"Error: {exc}",
+                exc_info=True,
+            )
+
+            self._findings = (
+                f"Error: {exc}"
+            )
+
+            self.tracer.event(
+                "error",
+                error=str(exc),
+            )
+
+            if self.investigation.flag_candidates:
+
+                self._flag = (
+                    self.investigation.flag_candidates[-1]
+                )
+
+                self._findings = (
+                    "Flag candidate "
+                    "(error): "
+                    f"{self._flag}"
+                )
+
+            return self._result(
+                ERROR
+            )
+
+    # -------------------------------------------------------------------
+    # Bump
+    # -------------------------------------------------------------------
+
+    def bump(
+        self,
+        insights: str,
+    ) -> None:
+        """Inject insights from sibling agents."""
+
         state_context = build_state_context(
             self.investigation,
-            max(0, self.request_budget - self._step_count[0]),
+            max(
+                0,
+                self.request_budget
+                - self._step_count[0],
+            ),
         )
 
         bump_msg = ModelRequest(
             parts=[
                 UserPromptPart(
                     content=(
-                        "Your previous attempt did not find the flag. Here are insights "
-                        "from other agents working on the same challenge:\n\n"
+                        "Your previous attempt did not "
+                        "find the flag. Here are insights "
+                        "from other agents working on the "
+                        "same challenge:\n\n"
                         f"{insights}\n\n"
-                        "Use these insights to try a different approach. "
-                        "Do NOT repeat what has already been tried.\n\n"
+                        "Use these insights to try a "
+                        "different approach. "
+                        "Do NOT repeat what has already "
+                        "been tried.\n\n"
                         f"{state_context}"
                     )
                 )
             ]
         )
-        self._messages.append(bump_msg)
-        self.loop_detector.reset()
-        self.tracer.event("bump", insights=insights[:500])
-        logger.info(f"[{self.agent_name}] Bumped with sibling insights")
 
-    def _result(self, status: str, run_steps: int | None = None, run_cost: float | None = None) -> SolverResult:
-        agent_usage = self.cost_tracker.by_agent.get(self.agent_name)
-        cost = agent_usage.cost_usd if agent_usage else 0.0
-        self.tracer.event("finish", status=status, flag=self._flag, confirmed=self._confirmed, cost_usd=round(cost, 4))
+        self._messages.append(
+            bump_msg
+        )
+
+        self.loop_detector.reset()
+
+        self.tracer.event(
+            "bump",
+            insights=insights[:500],
+        )
+
+        logger.info(
+            f"[{self.agent_name}] "
+            "Bumped with sibling insights"
+        )
+
+    # -------------------------------------------------------------------
+    # Result
+    # -------------------------------------------------------------------
+
+    def _result(
+        self,
+        status: str,
+        run_steps: int | None = None,
+        run_cost: float | None = None,
+    ) -> SolverResult:
+
+        agent_usage = (
+            self.cost_tracker.by_agent.get(
+                self.agent_name
+            )
+        )
+
+        cost = (
+            agent_usage.cost_usd
+            if agent_usage
+            else 0.0
+        )
+
+        self.tracer.event(
+            "finish",
+            status=status,
+            flag=self._flag,
+            confirmed=self._confirmed,
+            cost_usd=round(
+                cost,
+                4,
+            ),
+        )
+
         return SolverResult(
             flag=self._flag,
             status=status,
-            findings_summary=self._findings[:2000],
-            step_count=run_steps if run_steps is not None else self._step_count[0],
-            cost_usd=run_cost if run_cost is not None else cost,
+            findings_summary=(
+                self._findings[:2000]
+            ),
+            step_count=(
+                run_steps
+                if run_steps is not None
+                else self._step_count[0]
+            ),
+            cost_usd=(
+                run_cost
+                if run_cost is not None
+                else cost
+            ),
             log_path=self.tracer.path,
         )
 
+    # -------------------------------------------------------------------
+    # Stop
+    # -------------------------------------------------------------------
+
     async def stop(self) -> None:
-        self.tracer.event("stop", step_count=self._step_count[0])
+
+        self.tracer.event(
+            "stop",
+            step_count=self._step_count[0],
+        )
+
         self.tracer.close()
-        if self._owns_sandbox and self.sandbox:
+
+        if (
+            self._owns_sandbox
+            and self.sandbox
+        ):
             await self.sandbox.stop()
