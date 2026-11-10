@@ -1,5 +1,5 @@
 
-# CTFeSolver
+# CTFDeSolver
 
 This is a Python-based assistant for solving authorized Capture The Flag
 (CTF) challenges. It uses a single LLM-driven solver with a Docker workspace
