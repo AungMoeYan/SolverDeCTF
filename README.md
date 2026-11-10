@@ -1,7 +1,7 @@
 
-# CTF Agent
+# CTFeSolver
 
-CTF Agent is a Python-based assistant for solving authorized Capture The Flag
+This is a Python-based assistant for solving authorized Capture The Flag
 (CTF) challenges. It uses a single LLM-driven solver with a Docker workspace
 containing common tools for web, crypto, reversing, pwn, forensics, and
 steganography challenges.
