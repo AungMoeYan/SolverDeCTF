@@ -132,6 +132,35 @@ supports `bedrock`, `azure`, `zen`, and `google` providers. Configure the
 corresponding environment variables in `.env`; see `backend/config.py` and
 `backend/models.py` for the exact names.
 
+## Architecture and development status
+
+CTF Agent combines cloud-hosted LLM providers with containerization:
+
+- **Cloud providers:** supports Bedrock, Azure OpenAI, OpenCode Zen, and
+  Google AI models through Pydantic AI.
+- **Containerized tools:** each solver runs analysis tools in a Docker sandbox
+  with a read-only challenge mount and a separate writable workspace.
+- **CTFd integration:** can download challenge data and submit confirmed flags
+  to a CTFd instance.
+
+> [!WARNING]
+> This project is under active development. Use it only for authorized CTF
+> challenges and begin with `--no-submit`.
+
+### Development process
+
+The current development priorities are:
+
+1. Pass all operator instructions, hints, and evidence into the solver prompt.
+2. Add cooperative cancellation between LLM requests and tool calls.
+3. Keep the architecture consistent: complete multi-agent coordination or
+   remove its remaining hooks and remain single-agent.
+4. Separate LLM-request budgets from tool-call budgets.
+5. Add end-to-end tests for flag submission, dry runs, cancellation, prompt
+   context, and sandbox behavior.
+6. Treat challenge content and tool output as untrusted data to reduce
+   prompt-injection risk.
+
 ## Development
 
 Run the test suite:
