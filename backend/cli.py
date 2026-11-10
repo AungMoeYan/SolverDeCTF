@@ -566,14 +566,17 @@ async def _run_single(
         """Submit a flag through CTFd."""
 
         if no_submit:
-            return "Dry-run mode: flag submission disabled."
+            return "Dry-run mode: flag submission disabled.", False
 
         result = await ctfd.submit_flag(
             meta.name,
             flag,
         )
 
-        return result.display
+        return (
+            result.display,
+            result.status in ("correct", "already_solved"),
+        )
 
     solver.deps.submit_fn = submit_flag
 
@@ -828,14 +831,17 @@ async def _run_interactive(
         """Submit a flag through CTFd."""
 
         if no_submit:
-            return "Dry-run mode: flag submission disabled."
+            return "Dry-run mode: flag submission disabled.", False
 
         result = await ctfd.submit_flag(
             meta.name,
             flag,
         )
 
-        return result.display
+        return (
+            result.display,
+            result.status in ("correct", "already_solved"),
+        )
 
     solver.deps.submit_fn = submit_flag
 

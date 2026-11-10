@@ -3,9 +3,8 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from backend.cost_tracker import CostTracker
@@ -72,61 +71,3 @@ class SolverDeps:
     instruction: str = ""
 
     investigation: InvestigationState | None = None
-
-
-@dataclass
-class CoordinatorDeps:
-    """Runtime dependencies for the coordinator."""
-
-    ctfd: CTFdClient
-
-    cost_tracker: CostTracker
-
-    settings: Any
-
-    model_specs: list[str] = field(
-        default_factory=list
-    )
-
-    challenges_root: str = "challenges"
-
-    no_submit: bool = False
-
-    max_concurrent_challenges: int = 10
-
-    msg_port: int = 0
-
-    # ---------------------------------------------------------------
-    # Runtime state
-    # ---------------------------------------------------------------
-
-    coordinator_inbox: asyncio.Queue = field(
-        default_factory=asyncio.Queue
-    )
-
-    operator_inbox: asyncio.Queue = field(
-        default_factory=asyncio.Queue
-    )
-
-    swarms: dict[str, Any] = field(
-        default_factory=dict
-    )
-
-    swarm_tasks: dict[
-        str,
-        asyncio.Task,
-    ] = field(
-        default_factory=dict
-    )
-
-    results: dict[str, dict] = field(
-        default_factory=dict
-    )
-
-    challenge_dirs: dict[str, str] = field(
-        default_factory=dict
-    )
-
-    challenge_metas: dict[str, Any] = field(
-        default_factory=dict
-    )

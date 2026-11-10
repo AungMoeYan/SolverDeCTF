@@ -132,9 +132,6 @@ class DockerSandbox:
                 "HostConfig": {
                     "Binds": binds,
                     "ExtraHosts": ["host.docker.internal:host-gateway"],
-                    "CapAdd": ["SYS_ADMIN", "SYS_PTRACE"],
-                    "SecurityOpt": ["seccomp=unconfined"],
-                    "Devices": [{"PathOnHost": "/dev/loop-control", "PathInContainer": "/dev/loop-control", "CgroupPermissions": "rwm"}],
                     "Memory": self._parse_memory_limit(),
                     "NanoCpus": int(2 * 1e9),
                 },
